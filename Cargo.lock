@@ -881,6 +881,7 @@ name = "scnr2"
 version = "0.3.3"
 dependencies = [
  "log",
+ "regex",
  "scnr2_macro",
 ]
 
@@ -891,6 +892,7 @@ dependencies = [
  "log",
  "proc-macro2",
  "quote",
+ "regex",
  "regex-syntax",
  "rstest",
  "rustc-hash",

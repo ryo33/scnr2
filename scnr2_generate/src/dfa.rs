@@ -95,22 +95,18 @@ impl Dfa {
         // The transitions of the CompiledDfa.
         let mut states: Vec<DfaState> = vec![DfaState::default(); state_map.len()];
         for (nfa_states, dfa_id) in state_map.iter() {
-            // Update accepting states if the epsilon closure contains the end state
+            // Collect all accepting states from the NFA states in this DFA state
             for nfa_state in nfa_states {
                 if let Some(accept_data) = nfa.states[*nfa_state].accept_data.as_ref() {
                     let dfa_state = &mut states[*dfa_id];
-                    // Only set the accept data if there isn't one already
-                    // or if this one has higher priority (lower priority value)
-                    let should_replace = match &dfa_state.accept_data {
-                        None => true,
-                        Some(existing) => {
-                            accept_data.priority < existing.priority
-                                || (accept_data.priority == existing.priority
-                                    && accept_data.terminal_type < existing.terminal_type)
-                        }
-                    };
 
-                    if should_replace {
+                    // Check if we already have this pattern (by terminal_type and priority)
+                    let already_exists = dfa_state.accepts.iter().any(|existing| {
+                        existing.terminal_type == accept_data.terminal_type
+                            && existing.priority == accept_data.priority
+                    });
+
+                    if !already_exists {
                         // If the NFA state is accepting, add the accept data to the DFA state.
                         let mut accept_data = accept_data.clone();
                         // Convert the Nfa of the pattern's lookahead to a Dfa too.
@@ -136,11 +132,17 @@ impl Dfa {
                             }
                         }
                         // Add the accept data to the accepting states.
-                        dfa_state.set_accept_data(accept_data);
+                        dfa_state.add_accept(accept_data);
                     }
                 }
             }
         }
+
+        // Sort accepts in each DFA state by priority and specificity
+        for state in &mut states {
+            state.sort_accepts();
+        }
+
         for (from, cc, to) in transitions {
             states[from].transitions.push(DfaTransition::new(cc, to));
         }
@@ -184,6 +186,7 @@ impl ToTokens for DfaWithNumberOfCharacterClasses<'_> {
             let state = DfaStateWithNumberOfCharacterClasses {
                 state: s,
                 character_classes: self.character_classes,
+                regex_statics: None,
             };
             state.to_token_stream()
         });
@@ -201,8 +204,8 @@ impl ToTokens for DfaWithNumberOfCharacterClasses<'_> {
 pub struct DfaState {
     /// The set of transitions from this state.
     pub transitions: Vec<DfaTransition>,
-    /// The terminal types, the priorities and patterns if it is an accepting state.
-    pub accept_data: Option<Pattern>,
+    /// The accepting patterns for this state, sorted by priority and specificity.
+    pub accepts: Vec<Pattern>,
 }
 
 impl DfaState {
@@ -211,12 +214,18 @@ impl DfaState {
         Default::default()
     }
 
-    /// Set the accept data for this state.
+    /// Add accept data for this state.
+    /// Multiple accepts can be added; they will be sorted later.
     ///
     /// # Arguments
     /// * `accept_data` - The pattern that represents the accept data for this state.
-    pub fn set_accept_data(&mut self, accept_data: Pattern) {
-        self.accept_data = Some(accept_data);
+    pub fn add_accept(&mut self, accept_data: Pattern) {
+        self.accepts.push(accept_data);
+    }
+
+    /// Sort accepts by priority and specificity.
+    pub fn sort_accepts(&mut self) {
+        self.accepts.sort_by_key(|a| (a.priority, a.specificity()));
     }
 }
 
@@ -224,6 +233,8 @@ impl DfaState {
 pub(crate) struct DfaStateWithNumberOfCharacterClasses<'a> {
     pub(crate) state: &'a DfaState,
     pub(crate) character_classes: usize,
+    /// Mapping from capture_regex string → static identifier for pre-compiled regexes.
+    pub(crate) regex_statics: Option<&'a std::collections::HashMap<String, proc_macro2::Ident>>,
 }
 
 impl<'a> DfaStateWithNumberOfCharacterClasses<'a> {
@@ -232,6 +243,7 @@ impl<'a> DfaStateWithNumberOfCharacterClasses<'a> {
         Self {
             state,
             character_classes,
+            regex_statics: None,
         }
     }
 }
@@ -239,44 +251,39 @@ impl<'a> DfaStateWithNumberOfCharacterClasses<'a> {
 impl ToTokens for DfaStateWithNumberOfCharacterClasses<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let DfaStateWithNumberOfCharacterClasses {
-            state:
-                DfaState {
-                    transitions,
-                    accept_data,
-                },
+            state: DfaState {
+                transitions,
+                accepts,
+            },
             character_classes,
+            ..
         } = self;
         let mut transition_opts = vec![None; *character_classes];
         for transition in transitions {
             transition_opts[transition.elementary_interval_index.as_usize()] = Some(transition);
         }
-        // let transitions = transition_opts
-        //     .iter()
-        //     .fold(TokenStream::new(), |mut acc, opt| {
-        //         match opt {
-        //             Some(transition) => acc.extend(quote! {
-        //                 Some(#transition)
-        //             }),
-        //             None => acc.extend(quote! { None }),
-        //         }
-        //         acc
-        //     });
         let transitions = transition_opts.into_iter().map(|opt| match opt {
             Some(transition) => quote! { Some(#transition) },
             None => quote! { None },
         });
-        let accept_data = accept_data.as_ref().map_or_else(
-            || quote! { None },
-            |ad| {
-                let pattern_with_number_of_character_classes =
-                    PatternWithNumberOfCharacterClasses::new(ad, *character_classes);
-                quote! { Some(#pattern_with_number_of_character_classes) }
-            },
-        );
+
+        // Generate accepts slice
+        let regex_statics = self.regex_statics;
+        let accepts_tokens = accepts.iter().map(|ad| {
+            let mut pattern_with_number_of_character_classes =
+                PatternWithNumberOfCharacterClasses::new(ad, *character_classes);
+            if let (Some(map), Some(regex_str)) = (regex_statics, &ad.capture_regex)
+                && let Some(ident) = map.get(regex_str)
+            {
+                pattern_with_number_of_character_classes.regex_static_ident = Some(ident.clone());
+            }
+            quote! { #pattern_with_number_of_character_classes }
+        });
+
         tokens.extend(quote! {
             DfaState {
                 transitions: &[#(#transitions),*],
-                accept_data: #accept_data,
+                accepts: &[#(#accepts_tokens),*],
             }
         });
     }
@@ -350,11 +357,11 @@ mod tests {
         );
 
         // There should be at least one accepting state for each pattern
-        let mut terminals = dfa
+        let mut terminals: Vec<_> = dfa
             .states
             .iter()
-            .filter_map(|s| s.accept_data.as_ref().map(|ad| ad.terminal_type))
-            .collect::<Vec<_>>();
+            .flat_map(|s| s.accepts.iter().map(|ad| ad.terminal_type))
+            .collect();
         terminals.sort();
         terminals.dedup();
 

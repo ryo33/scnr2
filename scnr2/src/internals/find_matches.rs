@@ -3,7 +3,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use crate::{
-    Dfa, Lookahead, ScannerImpl,
+    AcceptData, Dfa, Lookahead, ScannerImpl,
     internals::{
         char_iter::item::CharItem,
         char_iter::iter::CharIter,
@@ -39,6 +39,19 @@ pub trait FindMatchesTrait {
 
     /// Restores the saved character iterator state.
     fn restore_saved_char_iter(&mut self);
+
+    /// Returns the matched text for the given byte range.
+    fn get_matched_text(&self, start: usize, end: usize) -> &str;
+
+    /// Evaluates a StateOp against matched text.
+    /// When `apply_capture` is false, capture ops are checked but do not mutate state.
+    /// Returns true if the operation succeeded or validation passed.
+    fn evaluate_state_op(
+        &self,
+        accept_data: &AcceptData,
+        matched_text: &str,
+        apply_capture: bool,
+    ) -> bool;
 }
 
 /// A structure that represents an iterator over character matches in a string slice.
@@ -66,6 +79,8 @@ pub struct FindMatches<'a, F>
 where
     F: Fn(char) -> Option<usize> + 'static + Clone,
 {
+    /// The input string slice being scanned.
+    input: &'a str,
     /// An iterator over characters in the input string slice, starting from the given offset.
     char_iter: CharIter<'a>,
     /// The creating scanner implementation, wrapped in an `Rc<RefCell>` for thread safety.
@@ -86,6 +101,7 @@ where
         match_function: &'static F,
     ) -> Self {
         FindMatches {
+            input,
             char_iter: CharIter::new(input, offset),
             scanner_impl,
             match_function,
@@ -172,6 +188,28 @@ where
     fn restore_saved_char_iter(&mut self) {
         self.char_iter.restore_state();
     }
+
+    /// Returns the matched text for the given byte range.
+    fn get_matched_text(&self, start: usize, end: usize) -> &str {
+        &self.input[start..end]
+    }
+
+    /// Evaluates a StateOp against matched text.
+    fn evaluate_state_op(
+        &self,
+        accept_data: &AcceptData,
+        matched_text: &str,
+        apply_capture: bool,
+    ) -> bool {
+        let Some(ref state_op) = accept_data.state_op else {
+            return true;
+        };
+        let Some(capture_regex) = accept_data.capture_regex else {
+            return false;
+        };
+        let scanner_impl = self.scanner_impl.borrow();
+        scanner_impl.evaluate_state_op(state_op, capture_regex, matched_text, apply_capture)
+    }
 }
 
 /// A structure that represents an iterator over character matches with positions in a string slice.
@@ -201,6 +239,8 @@ pub struct FindMatchesWithPosition<'a, F>
 where
     F: Fn(char) -> Option<usize> + 'static + Clone,
 {
+    /// The input string slice being scanned.
+    input: &'a str,
     /// An iterator over characters in the input string slice, starting from the given offset.
     char_iter: CharIterWithPosition<'a>,
     /// The creating scanner implementation, wrapped in an `Rc<RefCell>` for thread safety.
@@ -221,6 +261,7 @@ where
         match_function: &'static F,
     ) -> Self {
         FindMatchesWithPosition {
+            input,
             char_iter: CharIterWithPosition::new(input, offset),
             scanner_impl,
             match_function,
@@ -308,36 +349,50 @@ where
     fn restore_saved_char_iter(&mut self) {
         self.char_iter.restore_state();
     }
+
+    /// Returns the matched text for the given byte range.
+    fn get_matched_text(&self, start: usize, end: usize) -> &str {
+        &self.input[start..end]
+    }
+
+    /// Evaluates a StateOp against matched text.
+    fn evaluate_state_op(
+        &self,
+        accept_data: &AcceptData,
+        matched_text: &str,
+        apply_capture: bool,
+    ) -> bool {
+        let Some(ref state_op) = accept_data.state_op else {
+            return true;
+        };
+        let Some(capture_regex) = accept_data.capture_regex else {
+            return false;
+        };
+        let scanner_impl = self.scanner_impl.borrow();
+        scanner_impl.evaluate_state_op(state_op, capture_regex, matched_text, apply_capture)
+    }
 }
 
 /// Evaluates the lookahead condition for the current match.
 /// This method checks if the lookahead condition is satisfied based on the
 /// current match and the accept data.
-/// It returns a tuple containing a boolean indicating whether the lookahead is satisfied
-/// and the length of the lookahead match.
+/// It returns true if the lookahead condition is satisfied.
+/// Lookahead is zero-width: it never contributes bytes to the final match span.
 fn evaluate_lookahead<F: FindMatchesTrait + Clone>(
     mut find_matches: F,
     accept_data: &crate::AcceptData,
-) -> (bool, usize) {
+) -> bool {
     match &accept_data.lookahead {
         crate::Lookahead::None => {
             unreachable!("Lookahead::None should not be evaluated here")
         }
         crate::Lookahead::Positive(dfa) => {
             // Handle positive lookahead logic here
-            if let Some(ma) = find_next(&mut find_matches, dfa) {
-                (true, ma.span.len())
-            } else {
-                (false, 0)
-            }
+            find_next(&mut find_matches, dfa).is_some()
         }
         crate::Lookahead::Negative(dfa) => {
             // Handle negative lookahead logic here
-            if find_next(&mut find_matches, dfa).is_some() {
-                (false, 0)
-            } else {
-                (true, 0)
-            }
+            find_next(&mut find_matches, dfa).is_none()
         }
     }
 }
@@ -376,6 +431,7 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
     let mut state = 0; // Initial state of the DFA
     let mut match_start = MatchStart::default();
     let mut match_end = MatchEnd::default();
+    let mut best_accept: Option<&AcceptData> = None;
     let mut start_set = false;
     let mut end_set = false;
 
@@ -405,37 +461,82 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
             start_set = true;
         }
 
-        if let Some(accept_data) = &state_data.accept_data {
-            let (lookahead_satisfied, lookahead_len) =
-                if !matches!(accept_data.lookahead, Lookahead::None) {
-                    evaluate_lookahead(find_matches.clone(), accept_data)
-                } else {
-                    (true, 0)
-                };
-            if lookahead_satisfied {
-                let new_byte_index = char_item.byte_index + lookahead_len + char_item.ch.len_utf8();
-                let new_len = new_byte_index - match_start.byte_index;
-                let update = !end_set || {
-                    let old_len = match_end.byte_index - match_start.byte_index;
-                    new_len > old_len
-                        || (new_len == old_len && accept_data.priority < match_end.priority)
-                };
-                if update {
-                    match_end =
-                        MatchEnd::new(new_byte_index, accept_data.token_type, accept_data.priority)
-                            .with_position(
-                                char_item
-                                    .position
-                                    .map(|p| Position::new(p.line, p.column + 1)),
-                            );
-                    end_set = true;
-                    find_matches.save_char_iter();
-                }
+        // Iterate over all accepts at this DFA state, sorted by priority/specificity.
+        // The first accept that passes both lookahead and StateOp validation wins for this position.
+        for accept_data in state_data.accepts {
+            let lookahead_satisfied = if !matches!(accept_data.lookahead, Lookahead::None) {
+                evaluate_lookahead(find_matches.clone(), accept_data)
+            } else {
+                true
+            };
+            if !lookahead_satisfied {
+                continue;
             }
+
+            // Lookahead is an assertion only, so matched length is based on consumed DFA input only.
+            let new_byte_index = char_item.byte_index + char_item.ch.len_utf8();
+
+            // Evaluate StateOp if present
+            let state_op_satisfied = if accept_data.state_op.is_some() {
+                let matched_text =
+                    find_matches.get_matched_text(match_start.byte_index, new_byte_index);
+                find_matches.evaluate_state_op(accept_data, matched_text, false)
+            } else {
+                true
+            };
+
+            if !state_op_satisfied {
+                // StateOp failed - try next accept in priority/specificity order
+                continue;
+            }
+
+            // Found a valid accept at this DFA state.
+            // All accepts in this list are reached at the SAME input position (same end byte),
+            // so they have EQUAL length. Since the list is pre-sorted by priority/specificity,
+            // the first valid accept is the best one for this length.
+            let new_len = new_byte_index - match_start.byte_index;
+            let new_specificity = accept_data.specificity();
+            let update = !end_set || {
+                let old_len = match_end.byte_index - match_start.byte_index;
+                new_len > old_len
+                    || (new_len == old_len && accept_data.priority < match_end.priority)
+                    || (new_len == old_len
+                        && accept_data.priority == match_end.priority
+                        && new_specificity < match_end.specificity)
+            };
+            if update {
+                match_end = MatchEnd::new(
+                    new_byte_index,
+                    accept_data.token_type,
+                    accept_data.priority,
+                    new_specificity,
+                )
+                .with_position(
+                    char_item
+                        .position
+                        .map(|p| Position::new(p.line, p.column + 1)),
+                );
+                end_set = true;
+                best_accept = Some(accept_data);
+                find_matches.save_char_iter();
+            }
+            // Found a valid accept, no need to try more accepts at this DFA state for this position
+            break;
         }
     }
 
     if end_set {
+        if let Some(accept_data) = best_accept
+            && matches!(
+                accept_data.state_op,
+                Some(crate::StateOp::CaptureCount { .. } | crate::StateOp::CaptureStr { .. })
+            )
+        {
+            let matched_text =
+                find_matches.get_matched_text(match_start.byte_index, match_end.byte_index);
+            let ok = find_matches.evaluate_state_op(accept_data, matched_text, true);
+            debug_assert!(ok, "capture state op failed after successful dry-run");
+        }
         let span: crate::Span = match_start.byte_index..match_end.byte_index;
         find_matches.restore_saved_char_iter();
         Some(

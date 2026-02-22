@@ -9,7 +9,7 @@ use std::{
 use log::trace;
 
 use crate::{
-    Transition,
+    StateOp, StateValue, Transition, ValidationConstraint,
     internals::find_matches::{FindMatches, FindMatchesWithPosition},
 };
 
@@ -20,7 +20,7 @@ use crate::{
  * ```rust
  * use scnr2::{ScannerImpl, ScannerMode, Transition, Dfa, DfaState, DfaTransition, AcceptData, Lookahead};
  * // Simple DFA with a single state that always accepts.
- * const DFA: Dfa = Dfa { states: &[DfaState { transitions: &[None], accept_data: Some(AcceptData { token_type: 1, priority: 0, lookahead: Lookahead::None }) }] };
+ * const DFA: Dfa = Dfa { states: &[DfaState { transitions: &[None], accepts: &[AcceptData { token_type: 1, priority: 0, lookahead: Lookahead::None, state_op: None, capture_regex: None }] }] };
  * const MODES: &[ScannerMode] = &[ScannerMode { name: "INITIAL", transitions: &[Transition::SetMode(1, 0)], dfa: DFA }];
  * let scanner_impl = ScannerImpl::new(MODES);
  * assert_eq!(scanner_impl.current_mode_name(), "INITIAL");
@@ -35,6 +35,8 @@ pub struct ScannerImpl {
     pub(crate) modes: &'static [crate::ScannerMode],
     /// For each mode, stores a map of token types to their transitions.
     transition_map: OnceCell<Vec<HashMap<usize, Transition>>>,
+    /// Runtime state storage for dynamic delimiter matching.
+    pub(crate) state_storage: RefCell<HashMap<&'static str, StateValue>>,
 }
 
 impl ScannerImpl {
@@ -52,6 +54,7 @@ impl ScannerImpl {
             mode_stack: Cell::new(vec![]),
             modes,
             transition_map: OnceCell::new(),
+            state_storage: RefCell::new(HashMap::new()),
         }
     }
 
@@ -212,5 +215,193 @@ impl ScannerImpl {
     pub fn current_mode_name(&self) -> &'static str {
         self.mode_name(self.current_mode_index())
             .unwrap_or("Unknown")
+    }
+
+    // -------- Runtime State Operations --------
+
+    /// Evaluates a StateOp against the matched text.
+    ///
+    /// # Arguments
+    /// * `state_op` - The state operation to evaluate.
+    /// * `capture_regex` - The regex pattern for capturing groups.
+    /// * `matched_text` - The text that was matched by the DFA.
+    /// * `apply_capture` - If false, capture ops are checked but do not mutate state.
+    ///
+    /// # Returns
+    /// `true` if the operation succeeded (capture) or validation passed, `false` otherwise.
+    pub fn evaluate_state_op(
+        &self,
+        state_op: &StateOp,
+        capture_regex: &regex::Regex,
+        matched_text: &str,
+        apply_capture: bool,
+    ) -> bool {
+        let Some(captures) = capture_regex.captures(matched_text) else {
+            trace!(
+                "Capture regex did not match: {} against {}",
+                capture_regex.as_str(), matched_text
+            );
+            return false;
+        };
+
+        match state_op {
+            StateOp::CaptureCount {
+                state_name,
+                capture_pattern,
+                group,
+            } => {
+                if !apply_capture {
+                    return captures.get(*group).is_some();
+                }
+                self.capture_count(&captures, state_name, capture_pattern, *group)
+            }
+            StateOp::ValidateCount {
+                state_name,
+                capture_pattern,
+                group,
+                constraint,
+            } => self.validate_count(&captures, state_name, capture_pattern, *group, constraint),
+            StateOp::CaptureStr { state_name, group } => {
+                if !apply_capture {
+                    return captures.get(*group).is_some();
+                }
+                self.capture_str(&captures, state_name, *group)
+            }
+            StateOp::ValidateStr { state_name, group } => {
+                self.validate_str(&captures, state_name, *group)
+            }
+        }
+    }
+
+    /// Captures a count value into state storage.
+    fn capture_count(
+        &self,
+        captures: &regex::Captures<'_>,
+        state_name: &'static str,
+        capture_pattern: &str,
+        group: usize,
+    ) -> bool {
+        let Some(captured) = captures.get(group) else {
+            trace!("Capture group {} not found", group);
+            return false;
+        };
+
+        let captured_str = captured.as_str();
+        let count = self.count_pattern_occurrences(captured_str, capture_pattern);
+
+        trace!(
+            "CaptureCount: state={}, pattern={}, captured='{}', count={}",
+            state_name, capture_pattern, captured_str, count
+        );
+
+        self.state_storage
+            .borrow_mut()
+            .insert(state_name, StateValue::Count(count));
+        true
+    }
+
+    /// Validates a count value against stored state.
+    fn validate_count(
+        &self,
+        captures: &regex::Captures<'_>,
+        state_name: &'static str,
+        capture_pattern: &str,
+        group: usize,
+        constraint: &ValidationConstraint,
+    ) -> bool {
+        let Some(captured) = captures.get(group) else {
+            trace!("Capture group {} not found", group);
+            return false;
+        };
+
+        let captured_str = captured.as_str();
+        let captured_count = self.count_pattern_occurrences(captured_str, capture_pattern);
+
+        let storage = self.state_storage.borrow();
+        let Some(StateValue::Count(stored_n)) = storage.get(state_name) else {
+            trace!(
+                "ValidateCount: state {} not found or not a count",
+                state_name
+            );
+            return false;
+        };
+
+        let result = constraint.validate(captured_count, *stored_n);
+        trace!(
+            "ValidateCount: state={}, captured_str='{}', captured_count={}, stored_n={}, constraint={:?}, result={}",
+            state_name, captured_str, captured_count, stored_n, constraint, result
+        );
+        result
+    }
+
+    /// Captures a string value into state storage.
+    fn capture_str(
+        &self,
+        captures: &regex::Captures<'_>,
+        state_name: &'static str,
+        group: usize,
+    ) -> bool {
+        let Some(captured) = captures.get(group) else {
+            trace!("Capture group {} not found", group);
+            return false;
+        };
+
+        let captured_str = captured.as_str().to_string();
+        trace!(
+            "CaptureStr: state={}, captured={}",
+            state_name, captured_str
+        );
+
+        self.state_storage
+            .borrow_mut()
+            .insert(state_name, StateValue::Str(captured_str));
+        true
+    }
+
+    /// Validates a string value against stored state.
+    fn validate_str(
+        &self,
+        captures: &regex::Captures<'_>,
+        state_name: &'static str,
+        group: usize,
+    ) -> bool {
+        let Some(captured) = captures.get(group) else {
+            trace!("Capture group {} not found", group);
+            return false;
+        };
+
+        let captured_str = captured.as_str();
+
+        let storage = self.state_storage.borrow();
+        let Some(StateValue::Str(stored_str)) = storage.get(state_name) else {
+            trace!(
+                "ValidateStr: state {} not found or not a string",
+                state_name
+            );
+            return false;
+        };
+
+        let result = captured_str == stored_str;
+        trace!(
+            "ValidateStr: state={}, captured={}, stored={}, result={}",
+            state_name, captured_str, stored_str, result
+        );
+        result
+    }
+
+    /// Counts occurrences of a pattern in the captured string.
+    fn count_pattern_occurrences(&self, captured: &str, pattern: &str) -> usize {
+        if pattern.is_empty() {
+            return 0;
+        }
+
+        // Single-character path counts Unicode scalar values (not bytes).
+        if pattern.chars().count() == 1 {
+            let pattern_char = pattern.chars().next().unwrap();
+            return captured.chars().filter(|&c| c == pattern_char).count();
+        }
+
+        // Multi-character path counts non-overlapping literal substring occurrences.
+        captured.matches(pattern).count()
     }
 }

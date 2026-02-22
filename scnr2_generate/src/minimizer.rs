@@ -75,43 +75,28 @@ impl Minimizer {
         Self::create_from_partition(dfa, &partition_new, &transitions)
     }
 
-    /// The start partition is created as follows:
-    /// 1. The accepting states are put each in a separate group with group id set to terminal
-    ///    id + 1.
-    ///    This follows from the constraint of the DFA that multiple patterns can match.
-    ///    If a state has multiple accepting patterns, it is put in the group of the first
-    ///    accepting pattern.
-    /// 2. The non-accepting states are put together in one group with the id 0.
+    /// The start partition is created by grouping DFA states with identical accept lists.
+    /// This ensures states with different accept behavior are never merged.
     ///
     /// The partitions are stored in a vector of vectors.
     fn calculate_initial_partition(dfa: &Dfa) -> Partition {
-        let mut accepted_terminals = dfa
-            .states
-            .iter()
-            .filter_map(|state| {
-                state.accept_data.as_ref().map(|s| {
-                    // We take only the first accepting pattern of a state.
-                    s.terminal_type
-                })
-            })
-            .collect::<Vec<_>>();
-        accepted_terminals.sort();
-        accepted_terminals.dedup();
-        let number_of_end_states = accepted_terminals.len();
-        let mut initial_partition = vec![StateGroup::new(); number_of_end_states + 1];
+        let mut signatures: Vec<Vec<Pattern>> = Vec::new();
+        let mut initial_partition: Partition = Vec::new();
 
-        for state in 0..dfa.states.len() {
-            let state: DfaStateID = (state as StateIDBase).into();
-            if let Some(pattern) = &dfa.states[state].accept_data {
-                let index = accepted_terminals
-                    .iter()
-                    .position(|id| *id == pattern.terminal_type)
-                    .unwrap();
-                initial_partition[index + 1].insert(state);
+        for (idx, state) in dfa.states.iter().enumerate() {
+            let accepts = &state.accepts;
+            let group_idx = if let Some(pos) = signatures.iter().position(|sig| sig == accepts) {
+                pos
             } else {
-                initial_partition[0].insert(state);
-            }
+                signatures.push(accepts.clone());
+                initial_partition.push(StateGroup::new());
+                initial_partition.len() - 1
+            };
+
+            let state_id: DfaStateID = (idx as StateIDBase).into();
+            initial_partition[group_idx].insert(state_id);
         }
+
         initial_partition
     }
 
@@ -215,16 +200,17 @@ impl Minimizer {
             states: vec![DfaState::new(); partition.len()],
         };
         // Calculate the end states of the DFA.
-        let end_states = states
+        // For each state, collect all accepts (not just first one).
+        let end_states: Vec<_> = states
             .iter()
             .map(|state| {
-                if let Some(pattern) = state.accept_data.as_ref() {
-                    (true, pattern.clone())
+                if !state.accepts.is_empty() {
+                    (true, state.accepts.clone())
                 } else {
-                    (false, Pattern::default())
+                    (false, Vec::new())
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         // Reorder the groups so that the start state is in the first group (0).
         // The representative state of the first group must be the start state of the minimized DFA,
@@ -269,7 +255,7 @@ impl Minimizer {
         dfa: &mut Dfa,
         group_id: StateGroupID,
         group: &BTreeSet<DfaStateID>,
-        end_states: &[(bool, Pattern)],
+        end_states: &[(bool, Vec<Pattern>)],
     ) -> DfaStateID {
         let state_id = DfaStateID::new(group_id.id() as StateIDBase);
         let state = DfaState::new();
@@ -285,12 +271,22 @@ impl Minimizer {
         );
 
         // Insert the representative state into the accepting states if any state in its group is
-        // an accepting state.
+        // an accepting state. Merge all accepts from all states in the group.
         for state_in_group in group.iter() {
             if end_states[*state_in_group].0 {
-                dfa.states[state_id].set_accept_data(end_states[*state_in_group].1.clone());
+                for accept in &end_states[*state_in_group].1 {
+                    // Avoid duplicates
+                    if !dfa.states[state_id].accepts.iter().any(|a| {
+                        a.terminal_type == accept.terminal_type && a.priority == accept.priority
+                    }) {
+                        dfa.states[state_id].add_accept(accept.clone());
+                    }
+                }
             }
         }
+
+        // Sort accepts by priority and specificity
+        dfa.states[state_id].sort_accepts();
 
         state_id
     }
@@ -488,7 +484,7 @@ mod tests {
         let accepting_states = dfa
             .states
             .iter()
-            .filter(|s| s.accept_data.is_some())
+            .filter(|s| !s.accepts.is_empty())
             .count();
         const EXPECTED_DFA_ACCEPTING: usize = 1;
         assert_eq!(accepting_states, EXPECTED_DFA_ACCEPTING);
@@ -547,10 +543,29 @@ mod tests {
         let accepting_states = minimized_dfa
             .states
             .iter()
-            .filter(|s| s.accept_data.is_some())
+            .filter(|s| !s.accepts.is_empty())
             .count();
         assert_eq!(accepting_states, 1); // Example: 1 accepting state
 
-        assert!(minimized_dfa.states[4].accept_data.is_some());
+        assert!(!minimized_dfa.states[4].accepts.is_empty());
+    }
+
+    #[test]
+    fn test_initial_partition_distinguishes_accept_sets() {
+        let p1 = Pattern::new("a".to_string(), 1.into());
+        let p2 = Pattern::new("b".to_string(), 2.into());
+
+        let mut s0 = DfaState::new();
+        s0.accepts = vec![p1.clone()];
+        let mut s1 = DfaState::new();
+        s1.accepts = vec![p1.clone(), p2.clone()];
+
+        let dfa = Dfa {
+            states: vec![s0, s1],
+        };
+
+        let partition = Minimizer::calculate_initial_partition(&dfa);
+        assert_eq!(partition.len(), 2);
+        assert!(partition.iter().all(|g| g.len() == 1));
     }
 }

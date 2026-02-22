@@ -85,23 +85,32 @@ impl MatchStart {
     }
 }
 
-/// Helper structure to manage the end of matches with their positions, token type, and priority.
+/// Helper structure to manage the end of matches with their positions, token type, priority, and specificity.
 #[derive(Debug, Default)]
 pub(crate) struct MatchEnd {
     pub(crate) byte_index: usize,
     pub(crate) position: Option<Position>,
     pub(crate) token_type: usize,
     pub(crate) priority: usize,
+    /// Specificity for tie-breaking (lower is more specific).
+    /// 0 = Equals, 1 = Range, 2 = LessThan, 3 = None
+    pub(crate) specificity: usize,
 }
 
 impl MatchEnd {
-    /// Creates a new `MatchEnd` with the given byte index, token type, and priority.
-    pub(crate) fn new(byte_index: usize, token_type: usize, priority: usize) -> Self {
+    /// Creates a new `MatchEnd` with the given byte index, token type, priority, and specificity.
+    pub(crate) fn new(
+        byte_index: usize,
+        token_type: usize,
+        priority: usize,
+        specificity: usize,
+    ) -> Self {
         MatchEnd {
             byte_index,
             position: None,
             token_type,
             priority,
+            specificity,
         }
     }
 

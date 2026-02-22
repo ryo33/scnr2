@@ -1,6 +1,33 @@
+use std::collections::HashMap;
 use syn::braced;
 
-use crate::{pattern::Pattern, scanner_mode::ScannerMode};
+use crate::{
+    pattern::{
+        Pattern, StateOpSegment, STATE_CAP_PLACEHOLDER, STATE_SEG_PLACEHOLDER,
+        ensure_no_capturing_groups,
+    },
+    scanner_mode::ScannerMode,
+};
+
+// -------- State Declaration Types --------
+
+/// The type of a declared state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateType {
+    /// A count state with a range of valid values.
+    Count { min: usize, max: usize },
+    /// A string state with a regex pattern for valid values.
+    Str { pattern: String },
+}
+
+/// A state declaration in the scanner.
+#[derive(Debug, Clone)]
+pub struct StateDeclaration {
+    /// The name of the state.
+    pub name: String,
+    /// The type of the state.
+    pub state_type: StateType,
+}
 
 macro_rules! parse_ident {
     ($input:ident, $name:ident) => {
@@ -252,33 +279,292 @@ impl syn::parse::Parse for ScannerModeWithNamedTransitions {
 pub struct ScannerData {
     /// The scanner name.
     pub name: String,
+    /// The state declarations.
+    pub states: Vec<StateDeclaration>,
     /// The scanner modes.
     pub modes: Vec<ScannerModeWithNamedTransitions>,
 }
 impl ScannerData {
+    /// Returns a map of state names to their declarations.
+    pub fn state_map(&self) -> HashMap<&str, &StateDeclaration> {
+        self.states
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect()
+    }
+
     pub fn build_scanner_modes(&self) -> syn::Result<Vec<ScannerMode>> {
+        let state_map = self.state_map();
+
+        // Validate and resolve state references in all patterns
         let mut scanner_modes = Vec::new();
         let mut scanner_names = self
             .modes
             .iter()
             .map(|mode| mode.name.as_str())
             .collect::<Vec<_>>();
+
         for mode in &self.modes {
+            let mut resolved_patterns = Vec::new();
+
+            for pattern in &mode.patterns {
+                // Validate state references and resolve pattern with state bounds
+                let resolved = self.resolve_pattern_state_refs(pattern, &state_map)?;
+                resolved_patterns.push(resolved);
+            }
+
             let transitions = mode.convert_transitions(&scanner_names);
-            let scanner_mode = ScannerMode::new(&mode.name, mode.patterns.clone(), transitions);
+            let scanner_mode = ScannerMode::new(&mode.name, resolved_patterns, transitions);
             scanner_modes.push(scanner_mode);
             scanner_names.push(&mode.name);
         }
         Ok(scanner_modes)
     }
+
+    /// Resolves state references in a pattern, validating existence and type matching,
+    /// and generating correct regex bounds based on state declarations.
+    fn resolve_pattern_state_refs(
+        &self,
+        pattern: &Pattern,
+        state_map: &HashMap<&str, &StateDeclaration>,
+    ) -> syn::Result<Pattern> {
+        let Some(ref state_op) = pattern.state_op else {
+            // No state operation, return pattern as-is
+            return Ok(pattern.clone());
+        };
+
+        let (state_name, is_count) = match state_op {
+            StateOpSegment::CaptureCount { state_name, .. }
+            | StateOpSegment::ValidateCount { state_name, .. } => (state_name.as_str(), true),
+            StateOpSegment::CaptureStr { state_name, .. }
+            | StateOpSegment::ValidateStr { state_name, .. } => (state_name.as_str(), false),
+        };
+
+        // 1. Check state exists
+        let decl = state_map.get(state_name).ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("state '{}' is not declared", state_name),
+            )
+        })?;
+
+        // 2. Check type matches
+        match (&decl.state_type, is_count) {
+            (StateType::Count { .. }, false) => {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "state '{}' is declared as count, but used as str",
+                        state_name
+                    ),
+                ));
+            }
+            (StateType::Str { .. }, true) => {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "state '{}' is declared as str, but used as count",
+                        state_name
+                    ),
+                ));
+            }
+            _ => {}
+        }
+
+        // 3. Resolve the regex pattern with state bounds
+        let mut resolved = pattern.clone();
+
+        let (pattern_replacement, capture_replacement) = match state_op {
+            StateOpSegment::CaptureCount { pattern: p, .. }
+            | StateOpSegment::ValidateCount { pattern: p, .. } => {
+                if let StateType::Count { min, max } = &decl.state_type {
+                    // Count-based state: use bounded repetition on the literal pattern.
+                    let escaped_p = escape_regex_literal(p);
+                    let unit = format!("(?:{})", escaped_p);
+                    let bounded = format!("{}{{{},{}}}", unit, min, max);
+                    let capture_bounded = format!("({}{{{},{}}})", unit, min, max);
+                    (bounded, capture_bounded)
+                } else {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "expected count state type",
+                    ));
+                }
+            }
+            StateOpSegment::CaptureStr { .. } | StateOpSegment::ValidateStr { .. } => {
+                if let StateType::Str {
+                    pattern: str_pattern,
+                } = &decl.state_type
+                {
+                    // String-based state: inject declared pattern as a grouped segment.
+                    let grouped = format!("(?:{})", str_pattern);
+                    let capture_group = format!("({grouped})");
+                    (grouped, capture_group)
+                } else {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "expected str state type",
+                    ));
+                }
+            }
+        };
+
+        resolved.pattern = replace_placeholder_once(
+            &resolved.pattern,
+            STATE_SEG_PLACEHOLDER,
+            &pattern_replacement,
+            "pattern",
+        )?;
+        let capture_regex = resolved.capture_regex.as_ref().ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "internal error: missing capture regex for state op",
+            )
+        })?;
+        let updated_capture = replace_placeholder_once(
+            capture_regex,
+            STATE_CAP_PLACEHOLDER,
+            &capture_replacement,
+            "capture regex",
+        )?;
+        resolved.capture_regex = Some(updated_capture);
+
+        Ok(resolved)
+    }
+}
+
+fn escape_regex_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn replace_placeholder_once(
+    input: &str,
+    placeholder: &str,
+    replacement: &str,
+    context: &str,
+) -> syn::Result<String> {
+    let mut matches = input.match_indices(placeholder);
+    let first = matches.next();
+    let second = matches.next();
+
+    match (first, second) {
+        (None, _) => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "internal error: missing state placeholder in {context} during resolution"
+            ),
+        )),
+        (Some(_), Some(_)) => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "internal error: multiple state placeholders in {context} during resolution"
+            ),
+        )),
+        (Some((idx, _)), None) => {
+            let mut out = String::with_capacity(
+                input.len().saturating_sub(placeholder.len()) + replacement.len(),
+            );
+            out.push_str(&input[..idx]);
+            out.push_str(replacement);
+            out.push_str(&input[idx + placeholder.len()..]);
+            Ok(out)
+        }
+    }
+}
+
+/// Parses a state declaration like:
+/// ```text
+/// state n: count(0..=16);
+/// state marker: str(r"[A-Z]{1,6}");
+/// ```
+fn parse_state_declaration(content: &syn::parse::ParseBuffer) -> syn::Result<StateDeclaration> {
+    let name: syn::Ident = parse_ident!(content, state_name);
+    let name = name.to_string();
+    if name.is_empty() {
+        return Err(content.error("expected a state name"));
+    }
+    content.parse::<syn::Token![:]>()?;
+
+    let type_name: syn::Ident = parse_ident!(content, type_name);
+    let state_type = match type_name.to_string().as_str() {
+        "count" => {
+            // Parse count(min..=max) or count(min..max)
+            let paren_content;
+            syn::parenthesized!(paren_content in content);
+            let min: syn::LitInt = paren_content.parse().map_err(|_| {
+                paren_content.error("state range must use literal integers only")
+            })?;
+            let min = min.base10_parse::<usize>()?;
+
+            // Parse the range operator (..) or (..=)
+            paren_content.parse::<syn::Token![..]>()?;
+            let is_inclusive = paren_content.peek(syn::Token![=]);
+            if is_inclusive {
+                paren_content.parse::<syn::Token![=]>()?;
+            }
+
+            let max: syn::LitInt = paren_content.parse().map_err(|_| {
+                paren_content.error("state range must use literal integers only")
+            })?;
+            let max = max.base10_parse::<usize>()?;
+
+            // Validate range bounds and normalize to inclusive max for regex quantifiers.
+            let max = if is_inclusive {
+                if min > max {
+                    return Err(paren_content.error(
+                        "state range must satisfy min <= max for inclusive ranges",
+                    ));
+                }
+                max
+            } else {
+                if min >= max {
+                    return Err(paren_content.error(
+                        "state range must satisfy min < max for exclusive ranges",
+                    ));
+                }
+                max - 1
+            };
+
+            StateType::Count { min, max }
+        }
+        "str" => {
+            // Parse str(r"pattern")
+            let paren_content;
+            syn::parenthesized!(paren_content in content);
+            let pattern: syn::LitStr = paren_content.parse()?;
+            ensure_no_capturing_groups(&pattern.value(), pattern.span())?;
+            StateType::Str {
+                pattern: pattern.value(),
+            }
+        }
+        _ => {
+            return Err(content.error("expected 'count' or 'str' for state type"));
+        }
+    };
+
+    content.parse::<syn::Token![;]>()?;
+
+    Ok(StateDeclaration { name, state_type })
 }
 
 /// This is used to create a scanner from a part of a macro input.
 /// The macro input looks like this:
 /// ```text
 /// HelloWorld {
+///     state n: count(0..=16);  // Optional state declarations
 ///     // One or more scanner modes
 /// }
+/// ```
 impl syn::parse::Parse for ScannerData {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let name: syn::Ident = parse_ident!(input, scanner_name);
@@ -288,21 +574,58 @@ impl syn::parse::Parse for ScannerData {
         }
         let content;
         braced!(content in input);
+
+        let mut states: Vec<StateDeclaration> = Vec::new();
         let mut modes = Vec::new();
-        // Parse at least one scanner mode
-        let initial_mode: ScannerModeWithNamedTransitions = content.parse()?;
-        modes.push(initial_mode);
+
+        // Parse state declarations and modes
         while !content.is_empty() {
-            let mode: ScannerModeWithNamedTransitions = content.parse()?;
-            modes.push(mode);
+            // Peek at the next identifier to determine if it's a state or mode
+            let lookahead = content.lookahead1();
+            if lookahead.peek(syn::Ident) {
+                let fork = content.fork();
+                let ident: syn::Ident = fork.parse()?;
+                match ident.to_string().as_str() {
+                    "state" => {
+                        // Consume the "state" keyword from the actual stream
+                        let _: syn::Ident = parse_ident!(content, state);
+                        let state = parse_state_declaration(&content)?;
+                        if states.iter().any(|existing| existing.name == state.name) {
+                            return Err(content.error(format!(
+                                "state '{}' is declared more than once",
+                                state.name
+                            )));
+                        }
+                        states.push(state);
+                    }
+                    "mode" => {
+                        let mode: ScannerModeWithNamedTransitions = content.parse()?;
+                        modes.push(mode);
+                    }
+                    _ => {
+                        return Err(content.error("expected 'state' or 'mode'"));
+                    }
+                }
+            } else {
+                return Err(lookahead.error());
+            }
         }
-        Ok(ScannerData { name, modes })
+
+        if modes.is_empty() {
+            return Err(content.error("expected at least one mode"));
+        }
+
+        Ok(ScannerData {
+            name,
+            states,
+            modes,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::pattern::Lookahead;
+    use crate::pattern::{CompileTimeConstraint, CompileTimeExpr, Lookahead, StateOpSegment};
 
     use super::*;
 
@@ -412,5 +735,288 @@ mod tests {
         assert_eq!(mode_string_patterns[2].lookahead, Lookahead::None);
         assert_eq!(mode_string_patterns[3].lookahead, Lookahead::None);
         assert_eq!(mode_string_patterns[4].lookahead, Lookahead::None);
+    }
+
+    fn assert_parse_error(input: proc_macro2::TokenStream, expected: &str) {
+        let err = match syn::parse2::<ScannerData>(input) {
+            Ok(data) => data
+                .build_scanner_modes()
+                .expect_err("expected validation error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected),
+            "expected error to contain '{expected}', got '{msg}'"
+        );
+    }
+
+    #[test]
+    fn test_runtime_state_errors() {
+        // Missing token pattern segment
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    mode INITIAL {
+                        token => 1;
+                    }
+                }
+            },
+            "expected at least one pattern segment before '=>'",
+        );
+
+        // Lookahead without token pattern segment
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    mode INITIAL {
+                        token followed by r"x" => 1;
+                    }
+                }
+            },
+            "expected at least one pattern segment before '=>'",
+        );
+
+        // Reserved placeholder collisions in token regex with runtime state ops
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token r"__SCNR2_STATE_SEG__" + capture("#", n) => 1;
+                    }
+                }
+            },
+            "token regex cannot contain reserved internal placeholders '__SCNR2_STATE_SEG__' or '__SCNR2_STATE_CAP__' when using capture()/validate()",
+        );
+
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token r"__SCNR2_STATE_CAP__" + validate("#", n) => 1;
+                    }
+                }
+            },
+            "token regex cannot contain reserved internal placeholders '__SCNR2_STATE_SEG__' or '__SCNR2_STATE_CAP__' when using capture()/validate()",
+        );
+
+        // Undeclared state
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    mode INITIAL {
+                        token r"r" + capture("#", n) => 1;
+                    }
+                }
+            },
+            "state 'n' is not declared",
+        );
+
+        // State type mismatch (count used as str)
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token capture(n) => 1;
+                    }
+                }
+            },
+            "state 'n' is declared as count, but used as str",
+        );
+
+        // Multiple capture/validate in one pattern
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token capture("#", n) + capture("#", n) => 1;
+                    }
+                }
+            },
+            "only one capture() or validate() allowed per pattern",
+        );
+
+        // Capture and validate together
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token capture("#", n) + validate("#", n) => 1;
+                    }
+                }
+            },
+            "capture() and validate() cannot appear in the same pattern",
+        );
+
+        // Extra arguments in capture/validate calls
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state marker: str(r"[A-Z]+");
+                    mode INITIAL {
+                        token capture(marker, extra) => 1;
+                    }
+                }
+            },
+            "capture() takes exactly 1 argument",
+        );
+
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state marker: str(r"[A-Z]+");
+                    mode INITIAL {
+                        token validate(marker, extra) => 1;
+                    }
+                }
+            },
+            "validate() takes exactly 1 argument",
+        );
+
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=4);
+                    mode INITIAL {
+                        token validate("#", n, 0..n, extra) => 1;
+                    }
+                }
+            },
+            "validate() takes 2 or 3 arguments",
+        );
+
+        // Invalid constraint expression
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token r#"""# + validate("#", n, 1) => 1;
+                    }
+                }
+            },
+            "constraint expression must be 'n', a literal, or simple arithmetic",
+        );
+
+        // Open-ended range
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token r#"""# + validate("#", n, n..) => 1;
+                    }
+                }
+            },
+            "open-ended ranges (..n or n..) are not supported",
+        );
+
+        // Open-ended range (prefix form)
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    mode INITIAL {
+                        token r#"""# + validate("#", n, ..n) => 1;
+                    }
+                }
+            },
+            "open-ended ranges (..n or n..) are not supported",
+        );
+
+        // Invalid count ranges
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..0);
+                    mode INITIAL {
+                        token r"." => 1;
+                    }
+                }
+            },
+            "state range must satisfy min < max for exclusive ranges",
+        );
+
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(5..3);
+                    mode INITIAL {
+                        token r"." => 1;
+                    }
+                }
+            },
+            "state range must satisfy min < max for exclusive ranges",
+        );
+
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(3..=2);
+                    mode INITIAL {
+                        token r"." => 1;
+                    }
+                }
+            },
+            "state range must satisfy min <= max for inclusive ranges",
+        );
+
+        // Capturing groups in state declaration pattern
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state marker: str(r"(A)+");
+                    mode INITIAL {
+                        token capture(marker) => 1;
+                    }
+                }
+            },
+            "capturing groups are not allowed; use (?:...)",
+        );
+
+        // Duplicate state declaration
+        assert_parse_error(
+            quote::quote! {
+                BadScanner {
+                    state n: count(0..=2);
+                    state n: count(0..=4);
+                    mode INITIAL {
+                        token r"." => 1;
+                    }
+                }
+            },
+            "state 'n' is declared more than once",
+        );
+
+    }
+
+    #[test]
+    fn test_constraint_expr_arithmetic() {
+        let input = quote::quote! {
+            ArithmeticScanner {
+                state n: count(0..=4);
+                mode INITIAL {
+                    token r#"""# + validate("#", n, n-1..n+1) => 1;
+                }
+            }
+        };
+        let scanner_data: ScannerData = syn::parse2(input).unwrap();
+        let modes = scanner_data.build_scanner_modes().unwrap();
+        let pattern = &modes[0].patterns[0];
+        let Some(StateOpSegment::ValidateCount { constraint, .. }) = &pattern.state_op else {
+            panic!("expected validate count state op");
+        };
+        match constraint {
+            CompileTimeConstraint::Range { min, max_exclusive } => {
+                assert!(matches!(min, CompileTimeExpr::Sub(_, _)));
+                assert!(matches!(max_exclusive, CompileTimeExpr::Add(_, _)));
+            }
+            _ => panic!("expected range constraint"),
+        }
     }
 }

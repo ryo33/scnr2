@@ -31,16 +31,9 @@ impl CharacterClass {
         match &self.characters {
             regex_syntax::hir::HirKind::Empty => true, // An empty Hir matches everything.
             regex_syntax::hir::HirKind::Literal(literal) => {
-                // Literals here are separated into single characters.
-                let bytes = literal.0.clone();
-                // We convert the first 4 bytes to a u32.
-                // If the literal is smaller than 4 bytes, take will ensure we only take the bytes
-                // that exist.
-                let lit: u32 = bytes
-                    .iter()
-                    .take(4)
-                    .fold(0, |acc, &b| (acc << 8) | b as u32);
-                let c = char::from_u32(lit).unwrap_or('\0');
+                let Some(c) = literal_to_char(&literal.0) else {
+                    return false;
+                };
                 *interval == std::ops::RangeInclusive::new(c, c)
             }
             regex_syntax::hir::HirKind::Class(class) => {
@@ -130,20 +123,15 @@ impl CharacterClasses {
         for character_class in self.classes.iter() {
             match &character_class.characters {
                 regex_syntax::hir::HirKind::Literal(literal) => {
-                    // Literals here are separated into single characters.
-                    let bytes = literal.0.clone();
-                    // We convert the first 4 bytes to a u32.
-                    // If the literal is smaller than 4 bytes, take will ensure we only take the bytes
-                    // that exist.
-                    let lit: u32 = bytes
-                        .iter()
-                        .take(4)
-                        .fold(0, |acc, &b| (acc << 8) | b as u32);
-                    if let Some(c) = char::from_u32(lit) {
+                    if let Some(c) = literal_to_char(&literal.0) {
                         boundaries.insert(c);
                         // Add the character after the end as a boundary to create half-open
                         // intervals
-                        boundaries.insert(char::from_u32(lit + 1).unwrap_or(char::MAX));
+                        if let Some(next_char) = char::from_u32(c as u32 + 1) {
+                            boundaries.insert(next_char);
+                        } else {
+                            boundaries.insert(char::MAX);
+                        }
                     }
                 }
                 regex_syntax::hir::HirKind::Class(class) => match class {
@@ -338,6 +326,13 @@ impl CharacterClasses {
             }
         }
     }
+}
+
+fn literal_to_char(bytes: &[u8]) -> Option<char> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.chars().next();
+    }
+    bytes.first().and_then(|b| char::from_u32(*b as u32))
 }
 
 #[cfg(test)]

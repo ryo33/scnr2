@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 use syn::parse2;
@@ -113,6 +115,30 @@ pub fn generate(input: TokenStream) -> TokenStream {
 
     let number_of_character_classes = character_classes.intervals.len();
 
+    // Collect all unique capture_regex patterns and generate LazyLock statics
+    let mut regex_statics: HashMap<String, proc_macro2::Ident> = HashMap::new();
+    let mut regex_static_items: Vec<TokenStream> = Vec::new();
+    let mut regex_counter = 0usize;
+    for mode in &scanner_modes {
+        for pattern in &mode.patterns {
+            if let Some(ref regex) = pattern.capture_regex
+                && !regex_statics.contains_key(regex)
+            {
+                let ident = syn::Ident::new(
+                    &format!("__SCNR2_RE_{}", regex_counter),
+                    proc_macro2::Span::call_site(),
+                );
+                let full_regex = format!(r"\A(?:{})\z", regex);
+                regex_static_items.push(quote! {
+                    static #ident: std::sync::LazyLock<scnr2::regex::Regex> =
+                        std::sync::LazyLock::new(|| scnr2::regex::Regex::new(#full_regex).unwrap());
+                });
+                regex_statics.insert(regex.clone(), ident);
+                regex_counter += 1;
+            }
+        }
+    }
+
     let modes = scanner_modes.into_iter().enumerate().map(|(index, mode)| {
         let transitions = mode.transitions.iter().map(|transition_to_numeric_mode| {
             match transition_to_numeric_mode {
@@ -129,8 +155,11 @@ pub fn generate(input: TokenStream) -> TokenStream {
             }
         });
         let states = dfas[index].states.iter().map(|state| {
-            let dfa_state_with_number_of_character_classes =
+            let mut dfa_state_with_number_of_character_classes =
                 DfaStateWithNumberOfCharacterClasses::new(state, number_of_character_classes);
+            if !regex_statics.is_empty() {
+                dfa_state_with_number_of_character_classes.regex_statics = Some(&regex_statics);
+            }
             dfa_state_with_number_of_character_classes.to_token_stream()
         });
         let mode_name = mode.name;
@@ -145,7 +174,8 @@ pub fn generate(input: TokenStream) -> TokenStream {
 
     let output = quote! {
         pub mod #module_name_ident {
-            use scnr2::{AcceptData, Dfa, DfaState, DfaTransition, Lookahead, ScannerMode, ScannerImpl, Transition};
+            use scnr2::{AcceptData, ConstraintExpr, Dfa, DfaState, DfaTransition, Lookahead, ScannerMode, ScannerImpl, StateOp, Transition, ValidationConstraint};
+            #(#regex_static_items)*
             pub const MODES: &[ScannerMode] = &[
                 #(
                     #modes
