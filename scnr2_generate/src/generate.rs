@@ -279,7 +279,8 @@ mod tests {
                     token r"World" followed by r"!" => 11;
                     token r"!" not followed by r"!" => 12;
                     token r"[a-zA-Z_]\w*" => 13;
-                    token r"." => 14;
+                    token r"あ" => 14;
+                    token r"." => 15;
 
                     on 8 enter STRING;
                 }
@@ -288,7 +289,7 @@ mod tests {
                     token r"\\[\s--\r\n]*\r?\n" => 6;
                     token r#"[^\"\\]+"# => 7;
                     token r#"""# => 8;
-                    token r"." => 14;
+                    token r"." => 15;
 
                     on 8 enter INITIAL;
                 }

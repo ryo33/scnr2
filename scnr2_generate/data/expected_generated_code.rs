@@ -572,8 +572,8 @@ pub mod test_scanner {
                             None, None, None, None, None, None, None,
                         ],
                         accept_data: Some(AcceptData {
-                            token_type: 14usize,
-                            priority: 10usize,
+                            token_type: 15usize,
+                            priority: 11usize,
                             lookahead: Lookahead::None,
                         }),
                     },
@@ -600,8 +600,8 @@ pub mod test_scanner {
                             None,
                         ],
                         accept_data: Some(AcceptData {
-                            token_type: 14usize,
-                            priority: 10usize,
+                            token_type: 15usize,
+                            priority: 11usize,
                             lookahead: Lookahead::None,
                         }),
                     },
@@ -769,7 +769,7 @@ pub mod test_scanner {
                             None,
                         ],
                         accept_data: Some(AcceptData {
-                            token_type: 14usize,
+                            token_type: 15usize,
                             priority: 4usize,
                             lookahead: Lookahead::None,
                         }),
