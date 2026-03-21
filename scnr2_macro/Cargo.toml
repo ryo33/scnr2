@@ -10,6 +10,10 @@ readme.workspace = true
 description = "Scanner/Lexer with regex patterns and multiple modes"
 repository = "https://github.com/jsinger67/scnr2"
 
+[features]
+default = []
+dynamic-state = ["scnr2_generate/dynamic-state"]
+
 [dependencies]
 scnr2_generate = { path = "../scnr2_generate", version = "0.3.3"  }
 

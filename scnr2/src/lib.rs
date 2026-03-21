@@ -4,9 +4,14 @@
 //! scanner implementation, DFA (Deterministic Finite Automaton) states and transitions.
 
 // Re-export the scanner macro
+#[cfg(feature = "dynamic-state")]
+pub use regex;
 pub use scnr2_macro::scanner;
 
 // Expose only some necessary types and functions from the internals module
+#[cfg(feature = "dynamic-state")]
+#[doc(hidden)]
+pub mod dynamic_state;
 pub mod internals;
 pub use crate::internals::{
     char_iter::iter_with_position::CharIterWithPosition,
@@ -79,6 +84,9 @@ pub struct DfaState {
     /// transition for that character class.
     pub transitions: &'static [Option<DfaTransition>],
     pub accept_data: std::option::Option<AcceptData>,
+    #[cfg(feature = "dynamic-state")]
+    pub dynamic_candidates:
+        std::option::Option<&'static [crate::dynamic_state::DynamicAcceptCandidate]>,
 }
 
 /// Data associated with an accepting state in the DFA, including the type of token and lookahead

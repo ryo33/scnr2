@@ -8,6 +8,8 @@ use std::{
 
 use log::trace;
 
+#[cfg(feature = "dynamic-state")]
+use crate::dynamic_state::{DynamicGuard, DynamicOp, DynamicProjector, DynamicValue};
 use crate::{
     Transition,
     internals::find_matches::{FindMatches, FindMatchesWithPosition},
@@ -20,7 +22,12 @@ use crate::{
  * ```rust
  * use scnr2::{ScannerImpl, ScannerMode, Transition, Dfa, DfaState, DfaTransition, AcceptData, Lookahead};
  * // Simple DFA with a single state that always accepts.
- * const DFA: Dfa = Dfa { states: &[DfaState { transitions: &[None], accept_data: Some(AcceptData { token_type: 1, priority: 0, lookahead: Lookahead::None }) }] };
+ * const DFA: Dfa = Dfa { states: &[DfaState {
+ *     transitions: &[None],
+ *     accept_data: Some(AcceptData { token_type: 1, priority: 0, lookahead: Lookahead::None }),
+ *     #[cfg(feature = "dynamic-state")]
+ *     dynamic_candidates: None,
+ * }] };
  * const MODES: &[ScannerMode] = &[ScannerMode { name: "INITIAL", transitions: &[Transition::SetMode(1, 0)], dfa: DFA }];
  * let scanner_impl = ScannerImpl::new(MODES);
  * assert_eq!(scanner_impl.current_mode_name(), "INITIAL");
@@ -35,6 +42,8 @@ pub struct ScannerImpl {
     pub(crate) modes: &'static [crate::ScannerMode],
     /// For each mode, stores a map of token types to their transitions.
     transition_map: OnceCell<Vec<HashMap<usize, Transition>>>,
+    #[cfg(feature = "dynamic-state")]
+    dynamic_state: RefCell<HashMap<&'static str, DynamicValue>>,
 }
 
 impl ScannerImpl {
@@ -47,11 +56,17 @@ impl ScannerImpl {
     /// # Returns
     /// A new instance of `ScannerImpl`.
     pub fn new(modes: &'static [crate::ScannerMode]) -> Self {
+        Self::new_impl(modes)
+    }
+
+    fn new_impl(modes: &'static [crate::ScannerMode]) -> Self {
         ScannerImpl {
             current_mode: Cell::new(0),
             mode_stack: Cell::new(vec![]),
             modes,
             transition_map: OnceCell::new(),
+            #[cfg(feature = "dynamic-state")]
+            dynamic_state: RefCell::new(HashMap::new()),
         }
     }
 
@@ -212,5 +227,107 @@ impl ScannerImpl {
     pub fn current_mode_name(&self) -> &'static str {
         self.mode_name(self.current_mode_index())
             .unwrap_or("Unknown")
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    pub(crate) fn evaluate_dynamic_op(
+        &self,
+        op: &DynamicOp,
+        matched_text: &str,
+        apply_capture: bool,
+    ) -> bool {
+        match op {
+            DynamicOp::Capture {
+                state_name,
+                group,
+                projector,
+                capture_regex,
+            } => {
+                let Some(projected) =
+                    self.project_match(capture_regex, *group, projector, matched_text)
+                else {
+                    return false;
+                };
+                if apply_capture {
+                    self.dynamic_state
+                        .borrow_mut()
+                        .insert(*state_name, projected);
+                    true
+                } else {
+                    true
+                }
+            }
+            DynamicOp::Validate {
+                state_name,
+                group,
+                projector,
+                guard,
+                capture_regex,
+            } => {
+                let Some(projected) =
+                    self.project_match(capture_regex, *group, projector, matched_text)
+                else {
+                    return false;
+                };
+                let state = self.dynamic_state.borrow();
+                let Some(stored) = state.get(state_name) else {
+                    return false;
+                };
+                Self::guard_matches(guard, &projected, stored)
+            }
+        }
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    fn project_match(
+        &self,
+        capture_regex: &regex::Regex,
+        group: usize,
+        projector: &DynamicProjector,
+        matched_text: &str,
+    ) -> Option<DynamicValue> {
+        let captures = capture_regex.captures(matched_text)?;
+        let captured = captures.get(group)?.as_str();
+        Some(match projector {
+            DynamicProjector::Count { unit } => {
+                DynamicValue::Count(self.count_pattern_occurrences(captured, unit))
+            }
+            DynamicProjector::Str => DynamicValue::Str(captured.to_string()),
+        })
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    fn guard_matches(
+        guard: &DynamicGuard,
+        projected: &DynamicValue,
+        stored: &DynamicValue,
+    ) -> bool {
+        match (projected, stored) {
+            (DynamicValue::Count(projected), DynamicValue::Count(stored)) => match guard {
+                DynamicGuard::Equal => projected == stored,
+                DynamicGuard::LessThan => projected < stored,
+                DynamicGuard::Range { min, max_exclusive } => {
+                    let min = min.evaluate(*stored);
+                    let max_exclusive = max_exclusive.evaluate(*stored);
+                    *projected >= min && *projected < max_exclusive
+                }
+            },
+            (DynamicValue::Str(projected), DynamicValue::Str(stored)) => {
+                matches!(guard, DynamicGuard::Equal) && projected == stored
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    fn count_pattern_occurrences(&self, captured: &str, pattern: &str) -> usize {
+        if pattern.is_empty() {
+            return 0;
+        }
+        if pattern.chars().count() == 1 {
+            let pattern_char = pattern.chars().next().unwrap();
+            return captured.chars().filter(|&ch| ch == pattern_char).count();
+        }
+        captured.matches(pattern).count()
     }
 }

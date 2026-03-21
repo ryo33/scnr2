@@ -5,7 +5,7 @@ publish = false
 version = "0.1.0"
 
 [dependencies]
-scnr2 = { path = "../scnr2" }
+scnr2 = { path = "../scnr2", features = ["dynamic-state"] }
 scnr2_generate = { path = "../scnr2_generate" }
 
 [dev-dependencies]
@@ -32,3 +32,6 @@ path = "match_fuzz.rs"
 name = "match_errors"
 path = "match_errors.rs"
 
+[[test]]
+name = "runtime_state_test"
+path = "runtime_state_test.rs"

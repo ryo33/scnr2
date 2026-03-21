@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 use syn::parse2;
@@ -64,59 +66,83 @@ pub fn generate(input: TokenStream) -> TokenStream {
     let scanner_modes: Vec<ScannerMode> = scanner_data
         .build_scanner_modes()
         .expect("Failed to build scanner modes");
+    let has_dynamic_patterns = scanner_modes.iter().any(|mode| {
+        mode.patterns
+            .iter()
+            .any(|pattern| pattern.state_op.is_some())
+    });
 
-    // Generate NFAs for each scanner mode
+    if has_dynamic_patterns && !cfg!(feature = "dynamic-state") {
+        panic!("dynamic-state DSL requires enabling the `dynamic-state` feature on scnr2");
+    }
+
     let mut nfas = scanner_modes
         .iter()
         .map(|mode| {
-            // Build the NFA for each pattern in the scanner mode
             Nfa::build_from_patterns(&mode.patterns).expect("Failed to build NFA for pattern")
         })
         .collect::<Vec<_>>();
 
     let mut character_classes = CharacterClasses::new();
-    // For each NFA, generate the character classes
     for nfa in &nfas {
         nfa.collect_character_classes(&mut character_classes)
     }
-    // Generate disjoint character classes
     character_classes.create_disjoint_character_classes();
-    // Convert the NFA to use disjoint character classes
     for nfa in &mut nfas {
         nfa.convert_to_disjoint_character_classes(&character_classes);
     }
 
-    // Convert the nfas into DFAs
     let dfas = nfas
         .into_iter()
         .try_fold(Vec::new(), |mut acc, nfa| -> Result<Vec<Dfa>, syn::Error> {
-            // Convert the NFA to a DFA
             let dfa = Dfa::try_from(&nfa).map_err(|e| {
                 syn::Error::new(
                     proc_macro2::Span::call_site(),
                     format!("Failed to convert NFA to DFA: {e}"),
                 )
             })?;
-            // Add the DFA to the accumulator
             acc.push(dfa);
             Ok(acc)
         })
         .expect("Failed to convert NFAs to DFAs");
 
-    // Convert the scanner name to snake case for the module name
     let module_name = to_snake_case(&scanner_data.name);
     let module_name_ident = syn::Ident::new(&module_name, proc_macro2::Span::call_site());
-
-    // Make the scanner name an syn::Ident
     let scanner_name = syn::Ident::new(&scanner_data.name, proc_macro2::Span::call_site());
     let match_function_code = character_classes.generate("match_function");
-
     let number_of_character_classes = character_classes.intervals.len();
+    let has_dynamic_sidecar = dfas
+        .iter()
+        .any(|dfa| dfa.states.iter().any(|state| state.has_dynamic_accepts()));
+
+    let mut regex_statics: HashMap<String, proc_macro2::Ident> = HashMap::new();
+    let mut regex_static_items: Vec<TokenStream> = Vec::new();
+    if has_dynamic_sidecar {
+        let mut regex_counter = 0usize;
+        for mode in &scanner_modes {
+            for pattern in &mode.patterns {
+                if let Some(ref regex) = pattern.capture_regex
+                    && !regex_statics.contains_key(regex)
+                {
+                    let ident = syn::Ident::new(
+                        &format!("__SCNR2_RE_{}", regex_counter),
+                        proc_macro2::Span::call_site(),
+                    );
+                    let full_regex = format!(r"\A(?:{})\z", regex);
+                    regex_static_items.push(quote! {
+                        static #ident: std::sync::LazyLock<scnr2::regex::Regex> =
+                            std::sync::LazyLock::new(|| scnr2::regex::Regex::new(#full_regex).unwrap());
+                    });
+                    regex_statics.insert(regex.clone(), ident);
+                    regex_counter += 1;
+                }
+            }
+        }
+    }
 
     let modes = scanner_modes.into_iter().enumerate().map(|(index, mode)| {
         let transitions = mode.transitions.iter().map(|transition_to_numeric_mode| {
             match transition_to_numeric_mode {
-                // Convert the transition to a token type and new mode index
                 TransitionToNumericMode::SetMode(token_type, new_mode_index) => {
                     quote! { Transition::SetMode(#token_type, #new_mode_index) }
                 }
@@ -130,7 +156,15 @@ pub fn generate(input: TokenStream) -> TokenStream {
         });
         let states = dfas[index].states.iter().map(|state| {
             let dfa_state_with_number_of_character_classes =
-                DfaStateWithNumberOfCharacterClasses::new(state, number_of_character_classes);
+                DfaStateWithNumberOfCharacterClasses::new(
+                    state,
+                    number_of_character_classes,
+                    if has_dynamic_sidecar {
+                        Some(&regex_statics)
+                    } else {
+                        None
+                    },
+                );
             dfa_state_with_number_of_character_classes.to_token_stream()
         });
         let mode_name = mode.name;
@@ -143,9 +177,21 @@ pub fn generate(input: TokenStream) -> TokenStream {
         }
     });
 
-    let output = quote! {
+    let dynamic_imports = if has_dynamic_sidecar {
+        quote! {
+            use scnr2::dynamic_state::{
+                DynamicAcceptCandidate, DynamicExpr, DynamicGuard, DynamicOp, DynamicProjector,
+            };
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    quote! {
         pub mod #module_name_ident {
             use scnr2::{AcceptData, Dfa, DfaState, DfaTransition, Lookahead, ScannerMode, ScannerImpl, Transition};
+            #dynamic_imports
+            #(#regex_static_items)*
             pub const MODES: &[ScannerMode] = &[
                 #(
                     #modes
@@ -210,9 +256,7 @@ pub fn generate(input: TokenStream) -> TokenStream {
                 }
             }
         }
-    };
-
-    output
+    }
 }
 
 /// Converts a string from PascalCase or camelCase to snake_case
@@ -265,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "dynamic-state"))]
     fn test_generate() {
         let input = quote::quote! {
             TestScanner {
@@ -325,6 +370,62 @@ mod tests {
         let expected_code = std::fs::read_to_string("data/expected_generated_code.rs")
             .expect("Failed to read the expected code file")
             .replace("\r\n", "\n");
+        assert_eq!(formatted_code, expected_code);
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    #[test]
+    fn test_generate_dynamic_state() {
+        let input = quote::quote! {
+            RawStringScanner {
+                state n: count(0..=4);
+                mode INITIAL {
+                    token r"r" + capture("#", n) + r#"""# => 1;
+                    on 1 enter RAW;
+                }
+                mode RAW {
+                    token r#"""# + validate("#", n) => 20;
+                    token r#"""# + validate("#", n, 0..n) => 10;
+                    token r"[\s\S]" => 30;
+                    on 20 enter INITIAL;
+                }
+            }
+        };
+        let code = generate(input).to_string();
+
+        // Create a temporary file
+        let mut temp_file =
+            tempfile::NamedTempFile::new().expect("Failed to create temporary file");
+
+        // Write the generated code to the temporary file
+        temp_file
+            .write_all(code.as_bytes())
+            .expect("Failed to write to temporary file");
+
+        // Optionally, print the file path for debugging
+        println!("Temporary file created at: {:?}", temp_file.path());
+
+        // Format the file (if needed)
+        try_format(temp_file.path()).expect("Failed to format the temporary file");
+
+        // Load the formatted code and convert possible \r\n to \n for easier comparison
+        let formatted_code = std::fs::read_to_string(temp_file.path())
+            .expect("Failed to read the formatted temporary file")
+            .replace("\r\n", "\n");
+
+        if should_update_snapshots() {
+            // Update the expected code file
+            std::fs::write(
+                "data/expected_generated_code_dynamic_state.rs",
+                &formatted_code,
+            )
+            .expect("Failed to write the expected code file");
+        }
+
+        let expected_code =
+            std::fs::read_to_string("data/expected_generated_code_dynamic_state.rs")
+                .expect("Failed to read the expected code file")
+                .replace("\r\n", "\n");
         assert_eq!(formatted_code, expected_code);
     }
 }

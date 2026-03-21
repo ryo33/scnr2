@@ -2,8 +2,10 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+#[cfg(feature = "dynamic-state")]
+use crate::dynamic_state::DynamicOp;
 use crate::{
-    Dfa, Lookahead, ScannerImpl,
+    AcceptData, Dfa, Lookahead, ScannerImpl,
     internals::{
         char_iter::item::CharItem,
         char_iter::iter::CharIter,
@@ -39,6 +41,12 @@ pub trait FindMatchesTrait {
 
     /// Restores the saved character iterator state.
     fn restore_saved_char_iter(&mut self);
+
+    /// Returns the matched text for the given byte range.
+    fn get_matched_text(&self, start: usize, end: usize) -> &str;
+
+    #[cfg(feature = "dynamic-state")]
+    fn evaluate_dynamic_op(&self, op: &DynamicOp, matched_text: &str, apply_capture: bool) -> bool;
 }
 
 /// A structure that represents an iterator over character matches in a string slice.
@@ -66,6 +74,7 @@ pub struct FindMatches<'a, F>
 where
     F: Fn(char) -> Option<usize> + 'static + Clone,
 {
+    input: &'a str,
     /// An iterator over characters in the input string slice, starting from the given offset.
     char_iter: CharIter<'a>,
     /// The creating scanner implementation, wrapped in an `Rc<RefCell>` for thread safety.
@@ -86,6 +95,7 @@ where
         match_function: &'static F,
     ) -> Self {
         FindMatches {
+            input,
             char_iter: CharIter::new(input, offset),
             scanner_impl,
             match_function,
@@ -172,6 +182,17 @@ where
     fn restore_saved_char_iter(&mut self) {
         self.char_iter.restore_state();
     }
+
+    fn get_matched_text(&self, start: usize, end: usize) -> &str {
+        &self.input[start..end]
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    fn evaluate_dynamic_op(&self, op: &DynamicOp, matched_text: &str, apply_capture: bool) -> bool {
+        self.scanner_impl
+            .borrow()
+            .evaluate_dynamic_op(op, matched_text, apply_capture)
+    }
 }
 
 /// A structure that represents an iterator over character matches with positions in a string slice.
@@ -201,6 +222,7 @@ pub struct FindMatchesWithPosition<'a, F>
 where
     F: Fn(char) -> Option<usize> + 'static + Clone,
 {
+    input: &'a str,
     /// An iterator over characters in the input string slice, starting from the given offset.
     char_iter: CharIterWithPosition<'a>,
     /// The creating scanner implementation, wrapped in an `Rc<RefCell>` for thread safety.
@@ -221,6 +243,7 @@ where
         match_function: &'static F,
     ) -> Self {
         FindMatchesWithPosition {
+            input,
             char_iter: CharIterWithPosition::new(input, offset),
             scanner_impl,
             match_function,
@@ -308,37 +331,50 @@ where
     fn restore_saved_char_iter(&mut self) {
         self.char_iter.restore_state();
     }
+
+    fn get_matched_text(&self, start: usize, end: usize) -> &str {
+        &self.input[start..end]
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    fn evaluate_dynamic_op(&self, op: &DynamicOp, matched_text: &str, apply_capture: bool) -> bool {
+        self.scanner_impl
+            .borrow()
+            .evaluate_dynamic_op(op, matched_text, apply_capture)
+    }
 }
 
 /// Evaluates the lookahead condition for the current match.
 /// This method checks if the lookahead condition is satisfied based on the
 /// current match and the accept data.
-/// It returns a tuple containing a boolean indicating whether the lookahead is satisfied
-/// and the length of the lookahead match.
+/// It returns true if the lookahead is satisfied.
 fn evaluate_lookahead<F: FindMatchesTrait + Clone>(
     mut find_matches: F,
     accept_data: &crate::AcceptData,
-) -> (bool, usize) {
+) -> bool {
     match &accept_data.lookahead {
         crate::Lookahead::None => {
             unreachable!("Lookahead::None should not be evaluated here")
         }
-        crate::Lookahead::Positive(dfa) => {
-            // Handle positive lookahead logic here
-            if let Some(ma) = find_next(&mut find_matches, dfa) {
-                (true, ma.span.len())
-            } else {
-                (false, 0)
-            }
-        }
-        crate::Lookahead::Negative(dfa) => {
-            // Handle negative lookahead logic here
-            if find_next(&mut find_matches, dfa).is_some() {
-                (false, 0)
-            } else {
-                (true, 0)
-            }
-        }
+        crate::Lookahead::Positive(dfa) => find_next(&mut find_matches, dfa).is_some(),
+        crate::Lookahead::Negative(dfa) => find_next(&mut find_matches, dfa).is_none(),
+    }
+}
+
+#[cfg(feature = "dynamic-state")]
+fn candidate_matches<F: FindMatchesTrait + Clone>(
+    find_matches: &F,
+    accept_data: &AcceptData,
+    dynamic_op: Option<&DynamicOp>,
+    match_start: usize,
+    match_end: usize,
+) -> bool {
+    if let Some(dynamic_op) = dynamic_op {
+        let matched_text = find_matches.get_matched_text(match_start, match_end);
+        find_matches.evaluate_dynamic_op(dynamic_op, matched_text, false)
+    } else {
+        let _ = accept_data;
+        true
     }
 }
 
@@ -376,6 +412,8 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
     let mut state = 0; // Initial state of the DFA
     let mut match_start = MatchStart::default();
     let mut match_end = MatchEnd::default();
+    #[cfg(feature = "dynamic-state")]
+    let mut best_dynamic_op: Option<&DynamicOp> = None;
     let mut start_set = false;
     let mut end_set = false;
 
@@ -405,37 +443,85 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
             start_set = true;
         }
 
-        if let Some(accept_data) = &state_data.accept_data {
-            let (lookahead_satisfied, lookahead_len) =
-                if !matches!(accept_data.lookahead, Lookahead::None) {
-                    evaluate_lookahead(find_matches.clone(), accept_data)
-                } else {
-                    (true, 0)
-                };
-            if lookahead_satisfied {
-                let new_byte_index = char_item.byte_index + lookahead_len + char_item.ch.len_utf8();
+        #[cfg(feature = "dynamic-state")]
+        if let Some(candidates) = state_data.dynamic_candidates {
+            let new_byte_index = char_item.byte_index + char_item.ch.len_utf8();
+            for candidate in candidates {
+                if !matches!(candidate.accept.lookahead, Lookahead::None)
+                    && !evaluate_lookahead(find_matches.clone(), &candidate.accept)
+                {
+                    continue;
+                }
+                if !candidate_matches(
+                    find_matches,
+                    &candidate.accept,
+                    candidate.op.as_ref(),
+                    match_start.byte_index,
+                    new_byte_index,
+                ) {
+                    continue;
+                }
+
                 let new_len = new_byte_index - match_start.byte_index;
                 let update = !end_set || {
                     let old_len = match_end.byte_index - match_start.byte_index;
                     new_len > old_len
-                        || (new_len == old_len && accept_data.priority < match_end.priority)
+                        || (new_len == old_len && candidate.accept.priority < match_end.priority)
                 };
                 if update {
-                    match_end =
-                        MatchEnd::new(new_byte_index, accept_data.token_type, accept_data.priority)
-                            .with_position(
-                                char_item
-                                    .position
-                                    .map(|p| Position::new(p.line, p.column + 1)),
-                            );
+                    match_end = MatchEnd::new(
+                        new_byte_index,
+                        candidate.accept.token_type,
+                        candidate.accept.priority,
+                    )
+                    .with_position(
+                        char_item
+                            .position
+                            .map(|p| Position::new(p.line, p.column + 1)),
+                    );
                     end_set = true;
+                    best_dynamic_op = candidate.op.as_ref();
                     find_matches.save_char_iter();
                 }
+                break;
+            }
+            continue;
+        }
+
+        if let Some(accept_data) = &state_data.accept_data {
+            if !matches!(accept_data.lookahead, Lookahead::None)
+                && !evaluate_lookahead(find_matches.clone(), accept_data)
+            {
+                continue;
+            }
+            let new_byte_index = char_item.byte_index + char_item.ch.len_utf8();
+            let new_len = new_byte_index - match_start.byte_index;
+            let update = !end_set || {
+                let old_len = match_end.byte_index - match_start.byte_index;
+                new_len > old_len
+                    || (new_len == old_len && accept_data.priority < match_end.priority)
+            };
+            if update {
+                match_end =
+                    MatchEnd::new(new_byte_index, accept_data.token_type, accept_data.priority)
+                        .with_position(
+                            char_item
+                                .position
+                                .map(|p| Position::new(p.line, p.column + 1)),
+                        );
+                end_set = true;
+                find_matches.save_char_iter();
             }
         }
     }
 
     if end_set {
+        #[cfg(feature = "dynamic-state")]
+        if let Some(DynamicOp::Capture { .. }) = best_dynamic_op {
+            let matched_text =
+                find_matches.get_matched_text(match_start.byte_index, match_end.byte_index);
+            let _ = find_matches.evaluate_dynamic_op(best_dynamic_op.unwrap(), matched_text, true);
+        }
         let span: crate::Span = match_start.byte_index..match_end.byte_index;
         find_matches.restore_saved_char_iter();
         Some(

@@ -9,6 +9,109 @@ use crate::{
 };
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
+use regex_syntax::hir::{Hir, HirKind};
+
+// -------- Compile-Time State Operation Types --------
+
+/// Compile-time expression for constraint evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileTimeExpr {
+    /// A literal integer value.
+    Lit(usize),
+    /// The stored state value `n`.
+    N,
+    /// Addition of two expressions.
+    Add(Box<CompileTimeExpr>, Box<CompileTimeExpr>),
+    /// Subtraction of two expressions.
+    Sub(Box<CompileTimeExpr>, Box<CompileTimeExpr>),
+}
+
+/// Compile-time validation constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileTimeConstraint {
+    /// The captured count must equal the stored value.
+    Equals,
+    /// The captured count must be less than the stored value.
+    LessThan,
+    /// The captured count must be in the range [min, max_exclusive).
+    Range {
+        min: CompileTimeExpr,
+        max_exclusive: CompileTimeExpr,
+    },
+}
+
+/// Compile-time state operation segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateOpSegment {
+    /// Capture count of a pattern into a named state.
+    CaptureCount {
+        /// The pattern to count (e.g., "#").
+        pattern: String,
+        /// The state name to store the count.
+        state_name: String,
+        /// The 1-based capture group index.
+        group: usize,
+    },
+    /// Validate that the captured count satisfies a constraint.
+    ValidateCount {
+        /// The pattern to count (e.g., "#").
+        pattern: String,
+        /// The state name to validate against.
+        state_name: String,
+        /// The validation constraint.
+        constraint: CompileTimeConstraint,
+        /// The 1-based capture group index.
+        group: usize,
+    },
+    /// Capture a string into a named state.
+    CaptureStr {
+        /// The state name to store the string.
+        state_name: String,
+        /// The 1-based capture group index.
+        group: usize,
+    },
+    /// Validate that the captured string matches the stored value.
+    ValidateStr {
+        /// The state name to validate against.
+        state_name: String,
+        /// The 1-based capture group index.
+        group: usize,
+    },
+}
+
+impl ToTokens for CompileTimeExpr {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let expr = match self {
+            CompileTimeExpr::Lit(v) => quote! { DynamicExpr::Lit(#v) },
+            CompileTimeExpr::N => quote! { DynamicExpr::State },
+            CompileTimeExpr::Add(lhs, rhs) => {
+                quote! { DynamicExpr::Add(&#lhs, &#rhs) }
+            }
+            CompileTimeExpr::Sub(lhs, rhs) => {
+                quote! { DynamicExpr::Sub(&#lhs, &#rhs) }
+            }
+        };
+        tokens.extend(expr);
+    }
+}
+
+impl ToTokens for CompileTimeConstraint {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let constraint = match self {
+            CompileTimeConstraint::Equals => quote! { DynamicGuard::Equal },
+            CompileTimeConstraint::LessThan => quote! { DynamicGuard::LessThan },
+            CompileTimeConstraint::Range { min, max_exclusive } => {
+                quote! {
+                    DynamicGuard::Range {
+                        min: #min,
+                        max_exclusive: #max_exclusive,
+                    }
+                }
+            }
+        };
+        tokens.extend(constraint);
+    }
+}
 
 macro_rules! parse_ident {
     ($input:ident, $name:ident) => {
@@ -180,6 +283,10 @@ pub struct Pattern {
     pub priority: usize,
     /// The lookahead constraint for the pattern, which can be positive, negative, or none.
     pub lookahead: Lookahead,
+    /// Optional state operation for runtime validation.
+    pub state_op: Option<StateOpSegment>,
+    /// Optional capture regex pattern (full pattern with capture groups for runtime extraction).
+    pub capture_regex: Option<String>,
 }
 
 impl Pattern {
@@ -195,6 +302,8 @@ impl Pattern {
             terminal_type,
             priority: DEFAULT_PRIORITY,
             lookahead: Lookahead::None,
+            state_op: None,
+            capture_regex: None,
         }
     }
 
@@ -213,12 +322,258 @@ impl Pattern {
         self.priority = priority;
         self
     }
+
+    /// Sets the state operation for the pattern.
+    /// # Arguments
+    /// * `state_op` - The state operation to set.
+    pub fn with_state_op(mut self, state_op: StateOpSegment) -> Self {
+        self.state_op = Some(state_op);
+        self
+    }
+
+    /// Sets the capture regex for the pattern.
+    /// # Arguments
+    /// * `capture_regex` - The capture regex to set.
+    pub fn with_capture_regex(mut self, capture_regex: String) -> Self {
+        self.capture_regex = Some(capture_regex);
+        self
+    }
+}
+
+/// Parsed segment of a pattern with capture/validate operations.
+#[derive(Debug)]
+enum PatternSegment {
+    /// A regex literal segment.
+    Regex(String),
+    /// A capture operation segment.
+    Capture {
+        /// The pattern to capture (for count) or None (for str).
+        pattern: Option<String>,
+        /// The state name.
+        state_name: String,
+    },
+    /// A validate operation segment.
+    Validate {
+        /// The pattern to validate (for count) or None (for str).
+        pattern: Option<String>,
+        /// The state name.
+        state_name: String,
+        /// The constraint (for count validation).
+        constraint: Option<CompileTimeConstraint>,
+    },
+}
+
+// Reserved internal placeholders for runtime-state segment expansion.
+pub(crate) const STATE_SEG_PLACEHOLDER: &str = "__SCNR2_STATE_SEG__";
+pub(crate) const STATE_CAP_PLACEHOLDER: &str = "__SCNR2_STATE_CAP__";
+const RESERVED_PLACEHOLDER_ERROR: &str = "token regex cannot contain reserved internal placeholders '__SCNR2_STATE_SEG__' or '__SCNR2_STATE_CAP__' when using capture()/validate()";
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum StateOpKind {
+    Capture,
+    Validate,
+}
+
+pub(crate) fn ensure_no_capturing_groups(
+    pattern: &str,
+    span: proc_macro2::Span,
+) -> syn::Result<()> {
+    let hir = regex_syntax::parse(pattern).map_err(|e| {
+        syn::Error::new(span, format!("invalid regex pattern for state usage: {e}"))
+    })?;
+    if count_capturing_groups(&hir) > 0 {
+        return Err(syn::Error::new(
+            span,
+            "capturing groups are not allowed; use (?:...)",
+        ));
+    }
+    Ok(())
+}
+
+fn count_capturing_groups(hir: &Hir) -> usize {
+    match hir.kind() {
+        HirKind::Capture(capture) => 1 + count_capturing_groups(&capture.sub),
+        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
+            hirs.iter().map(count_capturing_groups).sum()
+        }
+        HirKind::Repetition(repetition) => count_capturing_groups(&repetition.sub),
+        HirKind::Look(_) | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Empty => 0,
+    }
+}
+
+fn count_capturing_groups_in_pattern(pattern: &str, span: proc_macro2::Span) -> syn::Result<usize> {
+    let hir = regex_syntax::parse(pattern)
+        .map_err(|e| syn::Error::new(span, format!("invalid regex pattern: {e}")))?;
+    Ok(count_capturing_groups(&hir))
+}
+
+/// Parses a capture or validate function call.
+/// Formats:
+/// - capture("#", n) or capture(marker)
+/// - validate("#", n) or validate("#", n, 0..n) or validate(marker)
+fn parse_capture_or_validate(input: syn::parse::ParseStream) -> syn::Result<PatternSegment> {
+    if !cfg!(feature = "dynamic-state") {
+        return Err(
+            input.error("capture()/validate() requires the `dynamic-state` feature on scnr2")
+        );
+    }
+    let func_name: syn::Ident = input.parse()?;
+    let func_name_str = func_name.to_string();
+
+    let paren_content;
+    syn::parenthesized!(paren_content in input);
+
+    // First argument can be a string literal (for count) or an identifier (for str)
+    if paren_content.peek(syn::LitStr) {
+        // Count-based capture/validate: capture("#", n) or validate("#", n, ...)
+        let pattern_lit: syn::LitStr = paren_content.parse()?;
+        let pattern = pattern_lit.value();
+
+        paren_content.parse::<syn::Token![,]>()?;
+        let state_name: syn::Ident = paren_content.parse()?;
+        let state_name = state_name.to_string();
+
+        if func_name_str == "capture" {
+            if !paren_content.is_empty() {
+                return Err(paren_content.error("capture() takes exactly 2 arguments"));
+            }
+            Ok(PatternSegment::Capture {
+                pattern: Some(pattern),
+                state_name,
+            })
+        } else if func_name_str == "validate" {
+            // Check for optional constraint: validate("#", n, 0..n)
+            let constraint = if paren_content.peek(syn::Token![,]) {
+                paren_content.parse::<syn::Token![,]>()?;
+                Some(parse_constraint(&paren_content)?)
+            } else {
+                None
+            };
+            if !paren_content.is_empty() {
+                return Err(paren_content.error("validate() takes 2 or 3 arguments"));
+            }
+
+            Ok(PatternSegment::Validate {
+                pattern: Some(pattern),
+                state_name,
+                constraint,
+            })
+        } else {
+            Err(syn::Error::new(
+                func_name.span(),
+                "expected 'capture' or 'validate'",
+            ))
+        }
+    } else {
+        // String-based capture/validate: capture(marker) or validate(marker)
+        let state_name: syn::Ident = paren_content.parse()?;
+        let state_name = state_name.to_string();
+
+        if func_name_str == "capture" {
+            if !paren_content.is_empty() {
+                return Err(paren_content.error("capture() takes exactly 1 argument"));
+            }
+            Ok(PatternSegment::Capture {
+                pattern: None,
+                state_name,
+            })
+        } else if func_name_str == "validate" {
+            if !paren_content.is_empty() {
+                return Err(paren_content.error("validate() takes exactly 1 argument"));
+            }
+            Ok(PatternSegment::Validate {
+                pattern: None,
+                state_name,
+                constraint: None,
+            })
+        } else {
+            Err(syn::Error::new(
+                func_name.span(),
+                "expected 'capture' or 'validate'",
+            ))
+        }
+    }
+}
+
+const CONSTRAINT_EXPR_ERROR: &str =
+    "constraint expression must be 'n', a literal, or simple arithmetic";
+const OPEN_ENDED_RANGE_ERROR: &str = "open-ended ranges (..n or n..) are not supported";
+
+/// Parses a constraint expression like 0..n or n
+fn parse_constraint(input: syn::parse::ParseStream) -> syn::Result<CompileTimeConstraint> {
+    // Reject open-ended ranges like ..n
+    if input.peek(syn::Token![..]) {
+        return Err(input.error(OPEN_ENDED_RANGE_ERROR));
+    }
+
+    // Parse the first part (min for range, or just the value)
+    let first = parse_constraint_expr(input)?;
+
+    // Check if this is a range
+    if input.peek(syn::Token![..]) {
+        input.parse::<syn::Token![..]>()?;
+        if input.is_empty() {
+            return Err(input.error(OPEN_ENDED_RANGE_ERROR));
+        }
+        let second = parse_constraint_expr(input)?;
+        Ok(CompileTimeConstraint::Range {
+            min: first,
+            max_exclusive: second,
+        })
+    } else {
+        // If first is N, this means "equals n"
+        match first {
+            CompileTimeExpr::N => Ok(CompileTimeConstraint::Equals),
+            CompileTimeExpr::Lit(_) | CompileTimeExpr::Add(_, _) | CompileTimeExpr::Sub(_, _) => {
+                Err(input.error(CONSTRAINT_EXPR_ERROR))
+            }
+        }
+    }
+}
+
+/// Parses a primary constraint expression (literal or n).
+fn parse_primary_expr(input: syn::parse::ParseStream) -> syn::Result<CompileTimeExpr> {
+    if input.peek(syn::LitInt) {
+        let lit: syn::LitInt = input.parse()?;
+        let value = lit.base10_parse::<usize>()?;
+        Ok(CompileTimeExpr::Lit(value))
+    } else {
+        let ident: syn::Ident = input.parse()?;
+        if ident == "n" {
+            Ok(CompileTimeExpr::N)
+        } else {
+            Err(syn::Error::new(ident.span(), CONSTRAINT_EXPR_ERROR))
+        }
+    }
+}
+
+/// Parses a constraint expression with optional arithmetic (n+1, n-2, etc.).
+fn parse_constraint_expr(input: syn::parse::ParseStream) -> syn::Result<CompileTimeExpr> {
+    let left = parse_primary_expr(input).map_err(|_| input.error(CONSTRAINT_EXPR_ERROR))?;
+
+    // Check for operator
+    if input.peek(syn::Token![+]) {
+        input.parse::<syn::Token![+]>()?;
+        let right = parse_primary_expr(input).map_err(|_| input.error(CONSTRAINT_EXPR_ERROR))?;
+        Ok(CompileTimeExpr::Add(Box::new(left), Box::new(right)))
+    } else if input.peek(syn::Token![-]) {
+        input.parse::<syn::Token![-]>()?;
+        let right = parse_primary_expr(input).map_err(|_| input.error(CONSTRAINT_EXPR_ERROR))?;
+        Ok(CompileTimeExpr::Sub(Box::new(left), Box::new(right)))
+    } else {
+        Ok(left)
+    }
 }
 
 /// This is used to create a pattern from a part of a macro input.
 /// The macro input looks like this:
 /// ```text
 /// token r"World" followed by r"!" => 11;
+/// ```
+/// Or with runtime state:
+/// ```text
+/// token r"r" + capture("#", n) + r#"""# => 1;
+/// token r#"""# + validate("#", n, 0..n) => 10;
 /// ```
 /// where the lookahead part can be either
 /// ```text
@@ -236,38 +591,196 @@ impl Pattern {
 /// pattern.
 impl syn::parse::Parse for Pattern {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let pattern: syn::LitStr = input.parse().map_err(|e| {
-            syn::Error::new(
-                e.span(),
-                format!("expected a string literal for the pattern: {input:?}"),
-            )
-        })?;
-        let pattern = pattern.value();
-        let mut lookahead: Option<Lookahead> = None;
-        // Check if there is a lookahead and parse it.
-        if input.peek(syn::Ident) {
-            // The parse implementation of the Lookahead struct will check if the ident is
-            // `followed` or `not`.
-            // If it is neither, it will return an error.
-            lookahead = Some(input.parse()?);
+        // Parse pattern segments (may be concatenated with +)
+        let mut segments = Vec::new();
+
+        // First segment must be a string literal or a function call
+        if input.peek(syn::LitStr) {
+            let pattern: syn::LitStr = input.parse()?;
+            segments.push(PatternSegment::Regex(pattern.value()));
+        } else if input.peek(syn::Ident) {
+            // Check if it's capture/validate or lookahead
+            let fork = input.fork();
+            let ident: syn::Ident = fork.parse()?;
+            if ident == "capture" || ident == "validate" {
+                segments.push(parse_capture_or_validate(input)?);
+            } else {
+                // It's a lookahead, no initial pattern segment
+            }
         }
+
+        // Parse additional segments concatenated with +
+        while input.peek(syn::Token![+]) {
+            input.parse::<syn::Token![+]>()?;
+
+            if input.peek(syn::LitStr) {
+                let pattern: syn::LitStr = input.parse()?;
+                segments.push(PatternSegment::Regex(pattern.value()));
+            } else {
+                // Must be capture or validate
+                segments.push(parse_capture_or_validate(input)?);
+            }
+        }
+
+        // Parse optional lookahead
+        let mut lookahead: Option<Lookahead> = None;
+        if input.peek(syn::Ident) {
+            let fork = input.fork();
+            let ident: syn::Ident = fork.parse()?;
+            if ident == "followed" || ident == "not" {
+                lookahead = Some(input.parse()?);
+            }
+        }
+
+        if segments.is_empty() {
+            return Err(input.error("expected at least one pattern segment before '=>'"));
+        }
+
+        // Parse => and token type
         input.parse::<syn::Token![=>]>()?;
         let token_type: syn::LitInt = input.parse()?;
         let token_type: TerminalIDBase = token_type.base10_parse()?;
-        let mut pattern = Pattern::new(pattern, token_type.into());
-        // Parse the semicolon at the end of the pattern.
+
+        // Parse semicolon
         if input.peek(syn::Token![;]) {
             input.parse::<syn::Token![;]>()?;
         } else {
             return Err(input.error("expected ';'"));
         }
 
-        // If a lookahead was parsed, set it on the pattern.
-        let lookahead = lookahead.unwrap_or(Lookahead::None);
-        pattern = pattern.with_lookahead(lookahead);
+        // Build the pattern from segments
+        let (pattern_str, state_op, capture_regex) = build_pattern_from_segments(&segments)?;
+
+        let mut pattern = Pattern::new(pattern_str, token_type.into());
+        pattern = pattern.with_lookahead(lookahead.unwrap_or(Lookahead::None));
+
+        if let Some(op) = state_op {
+            pattern = pattern.with_state_op(op);
+        }
+        if let Some(regex) = capture_regex {
+            pattern = pattern.with_capture_regex(regex);
+        }
 
         Ok(pattern)
     }
+}
+
+/// Builds a pattern string and extracts state operations from segments.
+fn build_pattern_from_segments(
+    segments: &[PatternSegment],
+) -> syn::Result<(String, Option<StateOpSegment>, Option<String>)> {
+    let mut pattern_parts = Vec::new();
+    let mut capture_regex_parts = Vec::new();
+    let mut state_op: Option<StateOpSegment> = None;
+    let mut state_op_kind: Option<StateOpKind> = None;
+    let mut capture_group_count: usize = 0;
+    let has_state_op = segments.iter().any(|seg| {
+        matches!(
+            seg,
+            PatternSegment::Capture { .. } | PatternSegment::Validate { .. }
+        )
+    });
+
+    for segment in segments {
+        match segment {
+            PatternSegment::Regex(s) => {
+                if has_state_op
+                    && (s.contains(STATE_SEG_PLACEHOLDER) || s.contains(STATE_CAP_PLACEHOLDER))
+                {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        RESERVED_PLACEHOLDER_ERROR,
+                    ));
+                }
+                pattern_parts.push(s.clone());
+                capture_regex_parts.push(s.clone());
+                if has_state_op {
+                    capture_group_count = capture_group_count.saturating_add(
+                        count_capturing_groups_in_pattern(s, proc_macro2::Span::call_site())?,
+                    );
+                }
+            }
+            PatternSegment::Capture {
+                pattern,
+                state_name,
+            } => {
+                if let Some(kind) = state_op_kind {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        if kind == StateOpKind::Validate {
+                            "capture() and validate() cannot appear in the same pattern"
+                        } else {
+                            "only one capture() or validate() allowed per pattern"
+                        },
+                    ));
+                }
+                state_op_kind = Some(StateOpKind::Capture);
+                let group = capture_group_count + 1;
+                pattern_parts.push(STATE_SEG_PLACEHOLDER.to_string());
+                capture_regex_parts.push(STATE_CAP_PLACEHOLDER.to_string());
+                capture_group_count = capture_group_count.saturating_add(1);
+
+                if let Some(p) = pattern {
+                    state_op = Some(StateOpSegment::CaptureCount {
+                        pattern: p.clone(),
+                        state_name: state_name.clone(),
+                        group,
+                    });
+                } else {
+                    state_op = Some(StateOpSegment::CaptureStr {
+                        state_name: state_name.clone(),
+                        group,
+                    });
+                }
+            }
+            PatternSegment::Validate {
+                pattern,
+                state_name,
+                constraint,
+            } => {
+                if let Some(kind) = state_op_kind {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        if kind == StateOpKind::Capture {
+                            "capture() and validate() cannot appear in the same pattern"
+                        } else {
+                            "only one capture() or validate() allowed per pattern"
+                        },
+                    ));
+                }
+                state_op_kind = Some(StateOpKind::Validate);
+                let group = capture_group_count + 1;
+                pattern_parts.push(STATE_SEG_PLACEHOLDER.to_string());
+                capture_regex_parts.push(STATE_CAP_PLACEHOLDER.to_string());
+                capture_group_count = capture_group_count.saturating_add(1);
+
+                if let Some(p) = pattern {
+                    let constraint = constraint.clone().unwrap_or(CompileTimeConstraint::Equals);
+
+                    state_op = Some(StateOpSegment::ValidateCount {
+                        pattern: p.clone(),
+                        state_name: state_name.clone(),
+                        constraint,
+                        group,
+                    });
+                } else {
+                    state_op = Some(StateOpSegment::ValidateStr {
+                        state_name: state_name.clone(),
+                        group,
+                    });
+                }
+            }
+        }
+    }
+
+    let pattern_str = pattern_parts.join("");
+    let capture_regex = if state_op.is_some() {
+        Some(capture_regex_parts.join(""))
+    } else {
+        None
+    };
+
+    Ok((pattern_str, state_op, capture_regex))
 }
 
 #[derive(Debug)]
@@ -301,6 +814,7 @@ impl ToTokens for PatternWithNumberOfCharacterClasses<'_> {
             pattern.lookahead.clone(),
             *character_classes,
         );
+
         tokens.extend(quote! {
             AcceptData {
                 token_type: #terminal_type,

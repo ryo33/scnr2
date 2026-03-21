@@ -8,7 +8,6 @@ use log::trace;
 use crate::{
     dfa::{Dfa, DfaState, DfaTransition},
     ids::{DfaStateID, DisjointCharClassID, StateGroupID, StateGroupIDBase, StateIDBase},
-    pattern::Pattern,
 };
 
 // The type definitions for the subset construction algorithm.
@@ -214,17 +213,7 @@ impl Minimizer {
         let mut dfa = Dfa {
             states: vec![DfaState::new(); partition.len()],
         };
-        // Calculate the end states of the DFA.
-        let end_states = states
-            .iter()
-            .map(|state| {
-                if let Some(pattern) = state.accept_data.as_ref() {
-                    (true, pattern.clone())
-                } else {
-                    (false, Pattern::default())
-                }
-            })
-            .collect::<Vec<_>>();
+        let end_states = &states;
 
         // Reorder the groups so that the start state is in the first group (0).
         // The representative state of the first group must be the start state of the minimized DFA,
@@ -249,7 +238,7 @@ impl Minimizer {
                 &mut dfa,
                 (id as StateGroupIDBase).into(),
                 group,
-                &end_states,
+                end_states,
             );
         }
 
@@ -269,7 +258,7 @@ impl Minimizer {
         dfa: &mut Dfa,
         group_id: StateGroupID,
         group: &BTreeSet<DfaStateID>,
-        end_states: &[(bool, Pattern)],
+        end_states: &[DfaState],
     ) -> DfaStateID {
         let state_id = DfaStateID::new(group_id.id() as StateIDBase);
         let state = DfaState::new();
@@ -287,8 +276,13 @@ impl Minimizer {
         // Insert the representative state into the accepting states if any state in its group is
         // an accepting state.
         for state_in_group in group.iter() {
-            if end_states[*state_in_group].0 {
-                dfa.states[state_id].set_accept_data(end_states[*state_in_group].1.clone());
+            if let Some(pattern) = end_states[*state_in_group].accept_data.as_ref() {
+                dfa.states[state_id].set_accept_data(pattern.clone());
+                #[cfg(feature = "dynamic-state")]
+                {
+                    dfa.states[state_id].accept_candidates =
+                        end_states[*state_in_group].accept_candidates.clone();
+                }
             }
         }
 

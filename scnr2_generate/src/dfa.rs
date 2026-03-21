@@ -7,6 +7,8 @@ use std::{
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+#[cfg(feature = "dynamic-state")]
+use crate::pattern::StateOpSegment;
 use crate::{
     Result,
     ids::{DfaStateID, DisjointCharClassID, NfaStateID, StateIDBase},
@@ -109,37 +111,33 @@ impl Dfa {
                                     && accept_data.terminal_type < existing.terminal_type)
                         }
                     };
-
-                    if should_replace {
-                        // If the NFA state is accepting, add the accept data to the DFA state.
-                        let mut accept_data = accept_data.clone();
-                        // Convert the Nfa of the pattern's lookahead to a Dfa too.
-                        let lookahead = std::mem::take(&mut accept_data.lookahead);
-                        match lookahead {
-                            Lookahead::None => {}
-                            Lookahead::Positive(AutomatonType::Nfa(nfa)) => {
-                                // Convert the NFA in the lookahead to a DFA.
-                                let dfa_lookahead = Dfa::try_from(&nfa)?;
-                                accept_data.lookahead =
-                                    Lookahead::Positive(AutomatonType::Dfa(dfa_lookahead));
-                            }
-                            Lookahead::Negative(AutomatonType::Nfa(nfa)) => {
-                                // Convert the NFA in the lookahead to a DFA.
-                                let dfa_lookahead = Dfa::try_from(&nfa)?;
-                                accept_data.lookahead =
-                                    Lookahead::Negative(AutomatonType::Dfa(dfa_lookahead));
-                            }
-                            _ => {
-                                panic!(
-                                    "Unexpected lookahead type in DFA conversion: {lookahead:?}"
-                                );
-                            }
+                    let mut accept_data = accept_data.clone();
+                    let lookahead = std::mem::take(&mut accept_data.lookahead);
+                    match lookahead {
+                        Lookahead::None => {}
+                        Lookahead::Positive(AutomatonType::Nfa(nfa)) => {
+                            let dfa_lookahead = Dfa::try_from(&nfa)?;
+                            accept_data.lookahead =
+                                Lookahead::Positive(AutomatonType::Dfa(dfa_lookahead));
                         }
-                        // Add the accept data to the accepting states.
-                        dfa_state.set_accept_data(accept_data);
+                        Lookahead::Negative(AutomatonType::Nfa(nfa)) => {
+                            let dfa_lookahead = Dfa::try_from(&nfa)?;
+                            accept_data.lookahead =
+                                Lookahead::Negative(AutomatonType::Dfa(dfa_lookahead));
+                        }
+                        _ => {
+                            panic!("Unexpected lookahead type in DFA conversion: {lookahead:?}");
+                        }
                     }
+                    if should_replace {
+                        dfa_state.set_accept_data(accept_data.clone());
+                    }
+                    #[cfg(feature = "dynamic-state")]
+                    dfa_state.add_accept_candidate(accept_data);
                 }
             }
+            #[cfg(feature = "dynamic-state")]
+            states[*dfa_id].sort_accept_candidates();
         }
         for (from, cc, to) in transitions {
             states[from].transitions.push(DfaTransition::new(cc, to));
@@ -181,10 +179,7 @@ impl<'a> DfaWithNumberOfCharacterClasses<'a> {
 impl ToTokens for DfaWithNumberOfCharacterClasses<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let states = self.dfa.states.iter().map(|s| {
-            let state = DfaStateWithNumberOfCharacterClasses {
-                state: s,
-                character_classes: self.character_classes,
-            };
+            let state = DfaStateWithNumberOfCharacterClasses::new(s, self.character_classes, None);
             state.to_token_stream()
         });
         tokens.extend(quote! {
@@ -203,6 +198,9 @@ pub struct DfaState {
     pub transitions: Vec<DfaTransition>,
     /// The terminal types, the priorities and patterns if it is an accepting state.
     pub accept_data: Option<Pattern>,
+    #[cfg(feature = "dynamic-state")]
+    /// All accept candidates in priority order.
+    pub accept_candidates: Vec<Pattern>,
 }
 
 impl DfaState {
@@ -218,49 +216,73 @@ impl DfaState {
     pub fn set_accept_data(&mut self, accept_data: Pattern) {
         self.accept_data = Some(accept_data);
     }
+
+    #[cfg(feature = "dynamic-state")]
+    pub fn add_accept_candidate(&mut self, accept_data: Pattern) {
+        if !self.accept_candidates.contains(&accept_data) {
+            self.accept_candidates.push(accept_data);
+        }
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    pub fn sort_accept_candidates(&mut self) {
+        self.accept_candidates.sort_by(|lhs, rhs| {
+            lhs.priority
+                .cmp(&rhs.priority)
+                .then_with(|| lhs.terminal_type.cmp(&rhs.terminal_type))
+        });
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    pub fn has_dynamic_accepts(&self) -> bool {
+        self.accept_candidates
+            .iter()
+            .any(|pattern| pattern.state_op.is_some())
+    }
+
+    #[cfg(not(feature = "dynamic-state"))]
+    pub fn has_dynamic_accepts(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct DfaStateWithNumberOfCharacterClasses<'a> {
     pub(crate) state: &'a DfaState,
     pub(crate) character_classes: usize,
+    #[cfg(feature = "dynamic-state")]
+    pub(crate) regex_statics: Option<&'a std::collections::HashMap<String, proc_macro2::Ident>>,
 }
 
 impl<'a> DfaStateWithNumberOfCharacterClasses<'a> {
     /// Creates a new DFA state with the given number of character classes.
-    pub fn new(state: &'a DfaState, character_classes: usize) -> Self {
+    pub fn new(
+        state: &'a DfaState,
+        character_classes: usize,
+        _regex_statics: Option<&'a std::collections::HashMap<String, proc_macro2::Ident>>,
+    ) -> Self {
         Self {
             state,
             character_classes,
+            #[cfg(feature = "dynamic-state")]
+            regex_statics: _regex_statics,
         }
     }
 }
 
 impl ToTokens for DfaStateWithNumberOfCharacterClasses<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let DfaStateWithNumberOfCharacterClasses {
-            state:
-                DfaState {
-                    transitions,
-                    accept_data,
-                },
-            character_classes,
-        } = self;
-        let mut transition_opts = vec![None; *character_classes];
+        let transitions = &self.state.transitions;
+        let accept_data = &self.state.accept_data;
+        let character_classes = self.character_classes;
+        #[cfg(feature = "dynamic-state")]
+        let accept_candidates = &self.state.accept_candidates;
+        #[cfg(feature = "dynamic-state")]
+        let regex_statics = self.regex_statics;
+        let mut transition_opts = vec![None; character_classes];
         for transition in transitions {
             transition_opts[transition.elementary_interval_index.as_usize()] = Some(transition);
         }
-        // let transitions = transition_opts
-        //     .iter()
-        //     .fold(TokenStream::new(), |mut acc, opt| {
-        //         match opt {
-        //             Some(transition) => acc.extend(quote! {
-        //                 Some(#transition)
-        //             }),
-        //             None => acc.extend(quote! { None }),
-        //         }
-        //         acc
-        //     });
         let transitions = transition_opts.into_iter().map(|opt| match opt {
             Some(transition) => quote! { Some(#transition) },
             None => quote! { None },
@@ -269,16 +291,115 @@ impl ToTokens for DfaStateWithNumberOfCharacterClasses<'_> {
             || quote! { None },
             |ad| {
                 let pattern_with_number_of_character_classes =
-                    PatternWithNumberOfCharacterClasses::new(ad, *character_classes);
+                    PatternWithNumberOfCharacterClasses::new(ad, character_classes);
                 quote! { Some(#pattern_with_number_of_character_classes) }
             },
         );
+        #[cfg(feature = "dynamic-state")]
+        let dynamic_candidates_field: TokenStream = if accept_candidates
+            .iter()
+            .any(|pattern| pattern.state_op.is_some())
+        {
+            let regex_statics =
+                regex_statics.expect("missing regex statics for dynamic accept candidates");
+            let candidates = accept_candidates.iter().map(|pattern| {
+                let accept = PatternWithNumberOfCharacterClasses::new(pattern, character_classes)
+                    .to_token_stream();
+                let op = dynamic_op_tokens(pattern, regex_statics);
+                quote! {
+                    DynamicAcceptCandidate {
+                        accept: #accept,
+                        op: #op,
+                    }
+                }
+            });
+            quote! {
+                dynamic_candidates: Some(&[#(#candidates),*]),
+            }
+        } else {
+            quote! {
+                dynamic_candidates: None,
+            }
+        };
+        #[cfg(not(feature = "dynamic-state"))]
+        let dynamic_candidates_field = TokenStream::new();
         tokens.extend(quote! {
             DfaState {
                 transitions: &[#(#transitions),*],
                 accept_data: #accept_data,
+                #dynamic_candidates_field
             }
         });
+    }
+}
+
+#[cfg(feature = "dynamic-state")]
+pub(crate) fn dynamic_op_tokens(
+    pattern: &Pattern,
+    regex_statics: &std::collections::HashMap<String, proc_macro2::Ident>,
+) -> TokenStream {
+    let Some(state_op) = pattern.state_op.as_ref() else {
+        return quote! { None };
+    };
+    let regex_ident = pattern
+        .capture_regex
+        .as_ref()
+        .and_then(|regex| regex_statics.get(regex))
+        .expect("missing regex static for dynamic pattern");
+
+    match state_op {
+        StateOpSegment::CaptureCount {
+            pattern,
+            state_name,
+            group,
+        } => {
+            quote! {
+                Some(DynamicOp::Capture {
+                    state_name: #state_name,
+                    group: #group,
+                    projector: DynamicProjector::Count { unit: #pattern },
+                    capture_regex: &#regex_ident,
+                })
+            }
+        }
+        StateOpSegment::ValidateCount {
+            pattern,
+            state_name,
+            constraint,
+            group,
+        } => {
+            let guard = constraint.to_token_stream();
+            quote! {
+                Some(DynamicOp::Validate {
+                    state_name: #state_name,
+                    group: #group,
+                    projector: DynamicProjector::Count { unit: #pattern },
+                    guard: #guard,
+                    capture_regex: &#regex_ident,
+                })
+            }
+        }
+        StateOpSegment::CaptureStr { state_name, group } => {
+            quote! {
+                Some(DynamicOp::Capture {
+                    state_name: #state_name,
+                    group: #group,
+                    projector: DynamicProjector::Str,
+                    capture_regex: &#regex_ident,
+                })
+            }
+        }
+        StateOpSegment::ValidateStr { state_name, group } => {
+            quote! {
+                Some(DynamicOp::Validate {
+                    state_name: #state_name,
+                    group: #group,
+                    projector: DynamicProjector::Str,
+                    guard: DynamicGuard::Equal,
+                    capture_regex: &#regex_ident,
+                })
+            }
+        }
     }
 }
 

@@ -10,10 +10,15 @@ readme.workspace = true
 description = "Scanner/Lexer with regex patterns and multiple modes"
 repository = "https://github.com/jsinger67/scnr2"
 
+[features]
+default = []
+dynamic-state = ["dep:regex"]
+
 [dependencies]
 log = "0.4.29"
 proc-macro2 = "1.0.105"
 quote = "1.0.43"
+regex = { version = "1", optional = true }
 regex-syntax = "0.8.5"
 rustc-hash = "2.1.1"
 syn = "2.0.114"
