@@ -7,6 +7,8 @@
 pub use scnr2_macro::scanner;
 
 // Expose only some necessary types and functions from the internals module
+#[cfg(feature = "dynamic-state")]
+pub mod dynamic_state;
 pub mod internals;
 pub use crate::internals::{
     char_iter::iter_with_position::CharIterWithPosition,
@@ -95,6 +97,8 @@ pub struct AcceptData {
     pub token_type: usize,
     pub priority: usize,
     pub lookahead: Lookahead,
+    #[cfg(feature = "dynamic-state")]
+    pub dynamic: Option<dynamic_state::DynamicPattern>,
 }
 
 /// Lookahead information for the DFA, which can be positive or negative.

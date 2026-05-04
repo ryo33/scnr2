@@ -83,6 +83,8 @@ fn convert_dfa(gen_dfa: &GenDfa, num_classes: usize) -> ::scnr2::Dfa {
                         token_type: ad.terminal_type.as_usize(),
                         priority: ad.priority,
                         lookahead,
+                        #[cfg(feature = "dynamic-state")]
+                        dynamic: None,
                     }
                 })
                 .collect();

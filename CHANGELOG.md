@@ -17,6 +17,15 @@ Be aware that this project is still v0.y.z which means that anything can change 
 We defined for this project that while being on major version zero we mark incompatible changes with
 new minor version numbers. Please note that this is no version handling covered by `Semver`.
 
+# Unreleased
+
+* Add optional `dynamic-state` feature for context-sensitive scanning.
+  * Support bounded count state with `state n: count(0..=N);`, `capture("#", n)`, and `validate("#", n, ...)`.
+  * Support string state with `state marker: str(r"...");`, `capture(marker)`, and `validate(marker)`.
+  * Keep dynamic capture/validation on generated DFA code without adding a runtime regex dependency.
+* Add `Scanner::reset_dynamic_state()` on generated dynamic-state scanners.
+* Harden DFA minimization so accepting states with different dynamic accept metadata remain distinct.
+
 # 0.5.2 - 2026-04-04
 
 * Packaging metadata improvements for Python release:

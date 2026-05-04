@@ -5,8 +5,12 @@ publish = false
 version = "0.1.0"
 
 [dependencies]
-scnr2 = { path = "../scnr2" }
-scnr2_generate = { path = "../scnr2_generate" }
+scnr2 = { path = "../scnr2", default-features = false }
+scnr2_generate = { path = "../scnr2_generate", default-features = false }
+
+[features]
+default = []
+dynamic-state = ["scnr2/dynamic-state", "scnr2_generate/dynamic-state"]
 
 [dev-dependencies]
 codspeed-criterion-compat = "4.5.0"
@@ -32,3 +36,7 @@ path = "match_fuzz.rs"
 name = "match_errors"
 path = "match_errors.rs"
 
+[[test]]
+name = "dynamic_state_test"
+path = "dynamic_state_test.rs"
+required-features = ["dynamic-state"]

@@ -85,22 +85,26 @@ impl Minimizer {
     ///
     /// The partitions are stored in a vector of vectors.
     fn calculate_initial_partition(dfa: &Dfa) -> Partition {
-        let mut acceptance_groups: BTreeMap<String, StateGroup> = BTreeMap::new();
+        let mut acceptance_groups: Vec<(Vec<Pattern>, StateGroup)> = Vec::new();
         let mut non_accepting_group = StateGroup::new();
 
         for (id, state) in dfa.states.iter().enumerate() {
             let state_id = (id as StateIDBase).into();
             if state.accept_data.is_empty() {
                 non_accepting_group.insert(state_id);
+            } else if let Some((_, group)) = acceptance_groups
+                .iter_mut()
+                .find(|(signature, _)| *signature == state.accept_data)
+            {
+                group.insert(state_id);
             } else {
-                let key = format!("{:?}", state.accept_data);
-                acceptance_groups.entry(key).or_default().insert(state_id);
+                acceptance_groups.push((state.accept_data.clone(), StateGroup::from([state_id])));
             }
         }
 
         let mut initial_partition = Vec::new();
         initial_partition.push(non_accepting_group);
-        for group in acceptance_groups.into_values() {
+        for (_, group) in acceptance_groups {
             initial_partition.push(group);
         }
         initial_partition
@@ -539,5 +543,61 @@ mod tests {
         assert_eq!(accepting_states, 1); // Example: 1 accepting state
 
         assert!(!minimized_dfa.states[4].accept_data.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_minimizer_keeps_states_with_different_dynamic_accepts_distinct() {
+        use crate::dynamic::{CompiledDynamicPattern, DynamicOp};
+
+        fn dynamic_accept(state_index: usize) -> Pattern {
+            Pattern::new("x".to_string(), 7.into()).with_dynamic(CompiledDynamicPattern {
+                op: DynamicOp::CaptureCount {
+                    state_index,
+                    unit: "#".to_string(),
+                    min: 0,
+                    max: 4,
+                },
+                prefix_regex: String::new(),
+                suffix_regex: String::new(),
+                capture_regex: None,
+                prefix_dfa: Some(Dfa::default()),
+                suffix_dfa: Some(Dfa::default()),
+                capture_dfa: None,
+            })
+        }
+
+        let mut start = DfaState::new();
+        start
+            .transitions
+            .push(DfaTransition::new(DisjointCharClassID::new(0), 1.into()));
+        start
+            .transitions
+            .push(DfaTransition::new(DisjointCharClassID::new(1), 2.into()));
+
+        let mut first_accept = DfaState::new();
+        first_accept.add_accept_data(dynamic_accept(0));
+
+        let mut second_accept = DfaState::new();
+        second_accept.add_accept_data(dynamic_accept(1));
+
+        let minimized = Minimizer::minimize(Dfa {
+            states: vec![start, first_accept, second_accept],
+        });
+
+        assert_eq!(minimized.states.len(), 3);
+        let dynamic_state_indexes = minimized
+            .states
+            .iter()
+            .flat_map(|state| state.accept_data.iter())
+            .filter_map(|pattern| {
+                pattern.compiled().map(|dynamic| match &dynamic.op {
+                    DynamicOp::CaptureCount { state_index, .. } => *state_index,
+                    _ => usize::MAX,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(dynamic_state_indexes.contains(&0));
+        assert!(dynamic_state_indexes.contains(&1));
     }
 }

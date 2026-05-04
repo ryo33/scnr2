@@ -8,9 +8,11 @@ use std::{
 
 use log::trace;
 
+#[cfg(feature = "dynamic-state")]
+use crate::dynamic_state::DynamicValue;
 use crate::{
-    internals::find_matches::{FindMatches, FindMatchesWithPosition},
     Transition,
+    internals::find_matches::{FindMatches, FindMatchesWithPosition},
 };
 
 /**
@@ -20,7 +22,14 @@ use crate::{
  * ```rust
  * use scnr2::{ScannerImpl, ScannerMode, Transition, Dfa, DfaState, DfaTransition, AcceptData, Lookahead};
  * // Simple DFA with a single state that always accepts.
- * const DFA: Dfa = Dfa { states: &[DfaState { transitions: &[None], accept_data: &[AcceptData { token_type: 1, priority: 0, lookahead: Lookahead::None }] }] };
+ * const ACCEPT: AcceptData = AcceptData {
+ *     token_type: 1,
+ *     priority: 0,
+ *     lookahead: Lookahead::None,
+ *     #[cfg(feature = "dynamic-state")]
+ *     dynamic: None,
+ * };
+ * const DFA: Dfa = Dfa { states: &[DfaState { transitions: &[None], accept_data: &[ACCEPT] }] };
  * const MODES: &[ScannerMode] = &[ScannerMode { name: "INITIAL", transitions: &[Transition::SetMode(1, 0)], dfa: DFA }];
  * let scanner_impl = ScannerImpl::new(MODES);
  * assert_eq!(scanner_impl.current_mode_name(), "INITIAL");
@@ -35,6 +44,8 @@ pub struct ScannerImpl {
     pub(crate) modes: &'static [crate::ScannerMode],
     /// For each mode, stores a map of token types to their transitions.
     transition_map: OnceCell<Vec<HashMap<usize, Transition>>>,
+    #[cfg(feature = "dynamic-state")]
+    dynamic_state: RefCell<Vec<Option<DynamicValue>>>,
 }
 
 impl ScannerImpl {
@@ -47,11 +58,37 @@ impl ScannerImpl {
     /// # Returns
     /// A new instance of `ScannerImpl`.
     pub fn new(modes: &'static [crate::ScannerMode]) -> Self {
+        Self::new_with_dynamic_state(modes, 0)
+    }
+
+    /// Creates a new scanner implementation with index-based dynamic state storage.
+    ///
+    /// Generated scanners call this constructor when the `dynamic-state`
+    /// feature is enabled and their DSL declares state slots.
+    pub fn new_with_dynamic_state(
+        modes: &'static [crate::ScannerMode],
+        #[cfg_attr(not(feature = "dynamic-state"), allow(unused_variables))]
+        dynamic_state_len: usize,
+    ) -> Self {
         ScannerImpl {
             current_mode: Cell::new(0),
             mode_stack: Cell::new(vec![]),
             modes,
             transition_map: OnceCell::new(),
+            #[cfg(feature = "dynamic-state")]
+            dynamic_state: RefCell::new(vec![None; dynamic_state_len]),
+        }
+    }
+
+    /// Clears all dynamic state values stored in this scanner instance.
+    ///
+    /// Dynamic state is intentionally persistent across `find_matches` calls on
+    /// the same scanner and is not affected by mode transitions. Use this method
+    /// to explicitly start a new independent dynamic-state lifecycle.
+    #[cfg(feature = "dynamic-state")]
+    pub fn reset_dynamic_state(&self) {
+        for value in self.dynamic_state.borrow_mut().iter_mut() {
+            *value = None;
         }
     }
 
@@ -212,5 +249,43 @@ impl ScannerImpl {
     pub fn current_mode_name(&self) -> &'static str {
         self.mode_name(self.current_mode_index())
             .unwrap_or("Unknown")
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    pub(crate) fn is_eligible_for<F>(
+        &self,
+        accept_data: &crate::AcceptData,
+        matched_text: &str,
+        class_for: F,
+    ) -> bool
+    where
+        F: Fn(char) -> Option<usize> + Copy,
+    {
+        match accept_data.dynamic.as_ref() {
+            Some(dynamic) => {
+                dynamic.is_eligible(&self.dynamic_state.borrow(), matched_text, class_for)
+            }
+            None => true,
+        }
+    }
+
+    #[cfg(feature = "dynamic-state")]
+    pub(crate) fn commit_capture<F>(
+        &self,
+        accept_data: &crate::AcceptData,
+        matched_text: &str,
+        class_for: F,
+    ) where
+        F: Fn(char) -> Option<usize> + Copy,
+    {
+        use crate::dynamic_state::DynamicOp;
+        if let Some(dynamic) = accept_data.dynamic.as_ref()
+            && let DynamicOp::CaptureCount { state_index, .. }
+            | DynamicOp::CaptureStr { state_index } = &dynamic.op
+            && let Some(value) = dynamic.project(matched_text, class_for)
+            && let Some(slot) = self.dynamic_state.borrow_mut().get_mut(*state_index)
+        {
+            *slot = Some(value);
+        }
     }
 }

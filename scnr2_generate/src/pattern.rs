@@ -1,10 +1,16 @@
 //! A pattern as a data structure that is used during the construction of the NFA.
 //! It contains the pattern string and the associated metadata.
 //! Metadata includes the terminal type and a possibly empty lookahead constraint.
+#[cfg(feature = "dynamic-state")]
+use crate::dynamic::{
+    CompiledDynamicPattern, DynamicPatternWithNumberOfCharacterClasses, DynamicSegment,
+    UnresolvedDynamicPattern, parse_capture_or_validate,
+};
 use crate::{
     Result,
     dfa::{Dfa, DfaWithNumberOfCharacterClasses},
     ids::{TerminalID, TerminalIDBase},
+    keyword::DslKeyword,
     nfa::Nfa,
 };
 use proc_macro2::TokenStream;
@@ -86,21 +92,20 @@ impl Lookahead {
 impl syn::parse::Parse for Lookahead {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let followed_or_not: syn::Ident = parse_ident!(input, followed_or_not);
-        if followed_or_not != "followed" && followed_or_not != "not" {
-            return Err(input.error("expected 'followed' or 'not'"));
-        }
-        let mut is_positive = true;
-        if followed_or_not == "not" {
-            is_positive = false;
-            let followed: syn::Ident = parse_ident!(input, followed);
-            if followed != "followed" {
-                return Err(input.error("expected 'followed'"));
+        let kw = DslKeyword::from_ident(&followed_or_not);
+        let is_positive = match kw {
+            Some(DslKeyword::Followed) => true,
+            Some(DslKeyword::Not) => {
+                let followed: syn::Ident = parse_ident!(input, followed);
+                if DslKeyword::from_ident(&followed) != Some(DslKeyword::Followed) {
+                    return Err(input.error("expected 'followed'"));
+                }
+                false
             }
-        }
-        // Otherwise followed_or_not is "followed" and we are in the positive case.
-        // Now we have to parse the "by" keyword.
+            _ => return Err(input.error("expected 'followed' or 'not'")),
+        };
         let by: syn::Ident = parse_ident!(input, by);
-        if by != "by" {
+        if DslKeyword::from_ident(&by) != Some(DslKeyword::By) {
             return Err(input.error("expected 'by'"));
         }
         // And finally the pattern.
@@ -168,6 +173,23 @@ impl ToTokens for LookaheadWithNumberOfCharacterClasses {
     }
 }
 
+/// Two-stage state of a `Pattern`'s dynamic-state metadata.
+///
+/// During parsing the segments live as `Unresolved`. `ScannerData::build_scanner_modes`
+/// resolves state references against the declared states and replaces the variant with
+/// `Compiled` before NFA/DFA construction. Storing both phases in one optional field
+/// makes the "exactly one phase at a time" invariant expressible in the type.
+#[cfg(feature = "dynamic-state")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternDynamic {
+    /// Parsed segments not yet resolved against state declarations.
+    Unresolved(UnresolvedDynamicPattern),
+    /// Fully resolved dynamic pattern with state indices and (after `compile`) DFAs.
+    /// Boxed because `CompiledDynamicPattern` is significantly larger than `Unresolved`,
+    /// which would otherwise inflate every `Pattern`.
+    Compiled(Box<CompiledDynamicPattern>),
+}
+
 /// A pattern is a data structure that is used during the construction of the NFA.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Pattern {
@@ -180,6 +202,8 @@ pub struct Pattern {
     pub priority: usize,
     /// The lookahead constraint for the pattern, which can be positive, negative, or none.
     pub lookahead: Lookahead,
+    #[cfg(feature = "dynamic-state")]
+    pub dynamic: Option<PatternDynamic>,
 }
 
 impl Pattern {
@@ -195,6 +219,8 @@ impl Pattern {
             terminal_type,
             priority: DEFAULT_PRIORITY,
             lookahead: Lookahead::None,
+            #[cfg(feature = "dynamic-state")]
+            dynamic: None,
         }
     }
 
@@ -212,6 +238,65 @@ impl Pattern {
     pub fn with_priority(mut self, priority: usize) -> Self {
         self.priority = priority;
         self
+    }
+
+    /// Attaches parsed (not yet resolved) dynamic-state segments to the pattern.
+    #[cfg(feature = "dynamic-state")]
+    pub fn with_unresolved_dynamic(mut self, dynamic: UnresolvedDynamicPattern) -> Self {
+        self.dynamic = Some(PatternDynamic::Unresolved(dynamic));
+        self
+    }
+
+    /// Replaces any prior dynamic-state metadata with a fully resolved `CompiledDynamicPattern`.
+    #[cfg(feature = "dynamic-state")]
+    pub fn with_dynamic(mut self, dynamic: CompiledDynamicPattern) -> Self {
+        self.dynamic = Some(PatternDynamic::Compiled(Box::new(dynamic)));
+        self
+    }
+
+    /// Returns the resolved dynamic pattern, if the pattern carries one.
+    #[cfg(feature = "dynamic-state")]
+    pub fn compiled(&self) -> Option<&CompiledDynamicPattern> {
+        match &self.dynamic {
+            Some(PatternDynamic::Compiled(c)) => Some(c.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns a mutable reference to the resolved dynamic pattern, if any.
+    #[cfg(feature = "dynamic-state")]
+    pub fn compiled_mut(&mut self) -> Option<&mut CompiledDynamicPattern> {
+        match &mut self.dynamic {
+            Some(PatternDynamic::Compiled(c)) => Some(c.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Returns the unresolved dynamic segments, if the pattern is still pre-resolution.
+    #[cfg(feature = "dynamic-state")]
+    pub fn unresolved(&self) -> Option<&UnresolvedDynamicPattern> {
+        match &self.dynamic {
+            Some(PatternDynamic::Unresolved(u)) => Some(u),
+            _ => None,
+        }
+    }
+
+    pub fn is_unconditional_accept(&self) -> bool {
+        if !matches!(self.lookahead, Lookahead::None) {
+            return false;
+        }
+        #[cfg(feature = "dynamic-state")]
+        {
+            !matches!(
+                self.compiled().map(|dynamic| &dynamic.op),
+                Some(crate::dynamic::DynamicOp::ValidateCount { .. })
+                    | Some(crate::dynamic::DynamicOp::ValidateStr { .. })
+            )
+        }
+        #[cfg(not(feature = "dynamic-state"))]
+        {
+            true
+        }
     }
 }
 
@@ -236,38 +321,145 @@ impl Pattern {
 /// pattern.
 impl syn::parse::Parse for Pattern {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let pattern: syn::LitStr = input.parse().map_err(|e| {
-            syn::Error::new(
-                e.span(),
-                format!("expected a string literal for the pattern: {input:?}"),
-            )
-        })?;
-        let pattern = pattern.value();
-        let mut lookahead: Option<Lookahead> = None;
-        // Check if there is a lookahead and parse it.
-        if input.peek(syn::Ident) {
-            // The parse implementation of the Lookahead struct will check if the ident is
-            // `followed` or `not`.
-            // If it is neither, it will return an error.
-            lookahead = Some(input.parse()?);
+        #[cfg(feature = "dynamic-state")]
+        {
+            parse_pattern_dynamic_enabled(input)
         }
-        input.parse::<syn::Token![=>]>()?;
-        let token_type: syn::LitInt = input.parse()?;
-        let token_type: TerminalIDBase = token_type.base10_parse()?;
-        let mut pattern = Pattern::new(pattern, token_type.into());
-        // Parse the semicolon at the end of the pattern.
-        if input.peek(syn::Token![;]) {
-            input.parse::<syn::Token![;]>()?;
-        } else {
-            return Err(input.error("expected ';'"));
+        #[cfg(not(feature = "dynamic-state"))]
+        {
+            parse_pattern_dynamic_disabled(input)
         }
-
-        // If a lookahead was parsed, set it on the pattern.
-        let lookahead = lookahead.unwrap_or(Lookahead::None);
-        pattern = pattern.with_lookahead(lookahead);
-
-        Ok(pattern)
     }
+}
+
+#[cfg(not(feature = "dynamic-state"))]
+fn parse_pattern_dynamic_disabled(input: syn::parse::ParseStream) -> syn::Result<Pattern> {
+    if input.peek(syn::Ident) {
+        let fork = input.fork();
+        let ident: syn::Ident = fork.parse()?;
+        if DslKeyword::from_ident(&ident).is_some_and(DslKeyword::is_dynamic_op) {
+            return Err(syn::Error::new(
+                ident.span(),
+                "capture()/validate() requires enabling the `dynamic-state` feature on scnr2",
+            ));
+        }
+    }
+    let pattern: syn::LitStr = input.parse().map_err(|e| {
+        syn::Error::new(
+            e.span(),
+            format!("expected a string literal for the pattern: {input:?}"),
+        )
+    })?;
+    let pattern = pattern.value();
+    if input.peek(syn::Token![+]) {
+        return Err(input.error("pattern concatenation requires the `dynamic-state` feature"));
+    }
+    let mut lookahead: Option<Lookahead> = None;
+    if input.peek(syn::Ident) {
+        lookahead = Some(input.parse()?);
+    }
+    input.parse::<syn::Token![=>]>()?;
+    let token_type: syn::LitInt = input.parse()?;
+    let token_type: TerminalIDBase = token_type.base10_parse()?;
+    let mut pattern = Pattern::new(pattern, token_type.into());
+    if input.peek(syn::Token![;]) {
+        input.parse::<syn::Token![;]>()?;
+    } else {
+        return Err(input.error("expected ';'"));
+    }
+    pattern = pattern.with_lookahead(lookahead.unwrap_or(Lookahead::None));
+    Ok(pattern)
+}
+
+#[cfg(feature = "dynamic-state")]
+fn parse_pattern_dynamic_enabled(input: syn::parse::ParseStream) -> syn::Result<Pattern> {
+    let mut segments = Vec::new();
+    if input.peek(syn::LitStr) {
+        let pattern: syn::LitStr = input.parse()?;
+        segments.push(DynamicSegment::Regex {
+            pattern: pattern.value(),
+            span: pattern.span(),
+        });
+    } else if input.peek(syn::Ident) {
+        let fork = input.fork();
+        let ident: syn::Ident = fork.parse()?;
+        if DslKeyword::from_ident(&ident).is_some_and(DslKeyword::is_dynamic_op) {
+            segments.push(parse_capture_or_validate(input)?);
+        } else {
+            return Err(syn::Error::new(
+                ident.span(),
+                "expected a string literal or capture()/validate()",
+            ));
+        }
+    } else {
+        return Err(input.error("expected a string literal or capture()/validate()"));
+    }
+    while input.peek(syn::Token![+]) {
+        input.parse::<syn::Token![+]>()?;
+        if input.peek(syn::LitStr) {
+            let pattern: syn::LitStr = input.parse()?;
+            segments.push(DynamicSegment::Regex {
+                pattern: pattern.value(),
+                span: pattern.span(),
+            });
+        } else {
+            segments.push(parse_capture_or_validate(input)?);
+        }
+    }
+    let mut lookahead: Option<Lookahead> = None;
+    // Check if there is a lookahead and parse it.
+    if input.peek(syn::Ident) {
+        let fork = input.fork();
+        let ident: syn::Ident = fork.parse()?;
+        match DslKeyword::from_ident(&ident) {
+            Some(kw) if kw.starts_lookahead() => {
+                lookahead = Some(input.parse()?);
+            }
+            Some(kw) if kw.is_dynamic_op() => {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "capture()/validate() segments must be joined with `+`",
+                ));
+            }
+            _ => {}
+        }
+    }
+    input.parse::<syn::Token![=>]>()?;
+    let token_type: syn::LitInt = input.parse()?;
+    let token_type: TerminalIDBase = token_type.base10_parse()?;
+    // Parse the semicolon at the end of the pattern.
+    if input.peek(syn::Token![;]) {
+        input.parse::<syn::Token![;]>()?;
+    } else {
+        return Err(input.error("expected ';'"));
+    }
+
+    let dynamic_op_count = segments
+        .iter()
+        .filter(|segment| {
+            matches!(
+                segment,
+                DynamicSegment::Capture { .. } | DynamicSegment::Validate { .. }
+            )
+        })
+        .count();
+    if dynamic_op_count > 1 {
+        return Err(input.error("only one capture() or validate() is allowed per pattern"));
+    }
+
+    let pattern_string = segments
+        .iter()
+        .filter_map(|segment| match segment {
+            DynamicSegment::Regex { pattern, .. } => Some(pattern.as_str()),
+            DynamicSegment::Capture { .. } | DynamicSegment::Validate { .. } => None,
+        })
+        .collect::<String>();
+    let mut pattern = Pattern::new(pattern_string, token_type.into())
+        .with_lookahead(lookahead.unwrap_or(Lookahead::None));
+    if dynamic_op_count == 1 {
+        pattern = pattern.with_unresolved_dynamic(UnresolvedDynamicPattern { segments });
+    }
+    Ok(pattern)
 }
 
 #[derive(Debug)]
@@ -301,11 +493,28 @@ impl ToTokens for PatternWithNumberOfCharacterClasses<'_> {
             pattern.lookahead.clone(),
             *character_classes,
         );
+        #[cfg(feature = "dynamic-state")]
+        let dynamic_field = {
+            let dynamic = pattern.compiled().map_or_else(
+                || quote! { None },
+                |compiled| {
+                    let dynamic = DynamicPatternWithNumberOfCharacterClasses::new(
+                        compiled,
+                        *character_classes,
+                    );
+                    quote! { Some(#dynamic) }
+                },
+            );
+            quote! { dynamic: #dynamic, }
+        };
+        #[cfg(not(feature = "dynamic-state"))]
+        let dynamic_field = TokenStream::new();
         tokens.extend(quote! {
             AcceptData {
                 token_type: #terminal_type,
                 priority: #priority,
                 lookahead: #lookahead_with_number_of_character_classes,
+                #dynamic_field
             }
         });
     }

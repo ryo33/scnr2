@@ -41,6 +41,35 @@ pub trait FindMatchesTrait {
     fn restore_saved_char_iter(&mut self);
 }
 
+/// Companion trait for iterators that participate in dynamic-state evaluation.
+///
+/// This trait is only present when the `dynamic-state` feature is enabled.
+#[cfg(feature = "dynamic-state")]
+pub trait DynamicStateAccess {
+    /// Returns the matched text for a byte range in the iterator input.
+    fn get_matched_text(&self, start: usize, end: usize) -> &str;
+
+    /// Checks whether dynamic validation permits this accept candidate.
+    fn is_eligible_for(&self, accept_data: &crate::AcceptData, matched_text: &str) -> bool;
+
+    /// Commits a capture from the final selected accept candidate.
+    fn commit_capture(&self, accept_data: &crate::AcceptData, matched_text: &str);
+}
+
+/// Marker trait for evaluators consumed by `find_next` and friends.
+///
+/// On `dynamic-state`, evaluators must additionally implement
+/// `DynamicStateAccess` so the runtime can consult per-instance state.
+#[cfg(feature = "dynamic-state")]
+pub(crate) trait FindMatchesEval: FindMatchesTrait + DynamicStateAccess + Clone {}
+#[cfg(feature = "dynamic-state")]
+impl<T> FindMatchesEval for T where T: FindMatchesTrait + DynamicStateAccess + Clone {}
+
+#[cfg(not(feature = "dynamic-state"))]
+pub(crate) trait FindMatchesEval: FindMatchesTrait + Clone {}
+#[cfg(not(feature = "dynamic-state"))]
+impl<T> FindMatchesEval for T where T: FindMatchesTrait + Clone {}
+
 /// A structure that represents an iterator over character matches in a string slice.
 /**
  * Iterator over token matches in the input text.
@@ -65,6 +94,8 @@ pub struct FindMatches<'a, F>
 where
     F: Fn(char) -> Option<usize> + 'static + ?Sized,
 {
+    #[cfg(feature = "dynamic-state")]
+    input: &'a str,
     /// An iterator over characters in the input string slice, starting from the given offset.
     char_iter: CharIter<'a>,
     /// The creating scanner implementation, wrapped in an `Rc<RefCell>` for thread safety.
@@ -79,6 +110,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(feature = "dynamic-state")]
+            input: self.input,
             char_iter: self.char_iter.clone(),
             scanner_impl: self.scanner_impl.clone(),
             match_function: self.match_function,
@@ -98,6 +131,8 @@ where
         match_function: &'static F,
     ) -> Self {
         FindMatches {
+            #[cfg(feature = "dynamic-state")]
+            input: &input[offset.min(input.len())..],
             char_iter: CharIter::new(input, offset),
             scanner_impl,
             match_function,
@@ -186,6 +221,28 @@ where
     }
 }
 
+#[cfg(feature = "dynamic-state")]
+impl<F> DynamicStateAccess for FindMatches<'_, F>
+where
+    F: Fn(char) -> Option<usize> + 'static + ?Sized,
+{
+    fn get_matched_text(&self, start: usize, end: usize) -> &str {
+        &self.input[start..end]
+    }
+
+    fn is_eligible_for(&self, accept_data: &crate::AcceptData, matched_text: &str) -> bool {
+        self.scanner_impl
+            .borrow()
+            .is_eligible_for(accept_data, matched_text, |ch| (self.match_function)(ch))
+    }
+
+    fn commit_capture(&self, accept_data: &crate::AcceptData, matched_text: &str) {
+        self.scanner_impl
+            .borrow()
+            .commit_capture(accept_data, matched_text, |ch| (self.match_function)(ch));
+    }
+}
+
 /// A structure that represents an iterator over character matches with positions in a string slice.
 /// It uses the `FindMatches` struct for implementation, but includes additional position
 /// information for each match.
@@ -212,6 +269,8 @@ pub struct FindMatchesWithPosition<'a, F>
 where
     F: Fn(char) -> Option<usize> + 'static + ?Sized,
 {
+    #[cfg(feature = "dynamic-state")]
+    input: &'a str,
     /// An iterator over characters in the input string slice, starting from the given offset.
     char_iter: CharIterWithPosition<'a>,
     /// The creating scanner implementation, wrapped in an `Rc<RefCell>` for thread safety.
@@ -226,6 +285,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
+            #[cfg(feature = "dynamic-state")]
+            input: self.input,
             char_iter: self.char_iter.clone(),
             scanner_impl: self.scanner_impl.clone(),
             match_function: self.match_function,
@@ -245,6 +306,8 @@ where
         match_function: &'static F,
     ) -> Self {
         FindMatchesWithPosition {
+            #[cfg(feature = "dynamic-state")]
+            input: &input[offset.min(input.len())..],
             char_iter: CharIterWithPosition::new(input, offset),
             scanner_impl,
             match_function,
@@ -334,12 +397,34 @@ where
     }
 }
 
+#[cfg(feature = "dynamic-state")]
+impl<F> DynamicStateAccess for FindMatchesWithPosition<'_, F>
+where
+    F: Fn(char) -> Option<usize> + 'static + ?Sized,
+{
+    fn get_matched_text(&self, start: usize, end: usize) -> &str {
+        &self.input[start..end]
+    }
+
+    fn is_eligible_for(&self, accept_data: &crate::AcceptData, matched_text: &str) -> bool {
+        self.scanner_impl
+            .borrow()
+            .is_eligible_for(accept_data, matched_text, |ch| (self.match_function)(ch))
+    }
+
+    fn commit_capture(&self, accept_data: &crate::AcceptData, matched_text: &str) {
+        self.scanner_impl
+            .borrow()
+            .commit_capture(accept_data, matched_text, |ch| (self.match_function)(ch));
+    }
+}
+
 /// Evaluates the lookahead condition for the current match.
 /// This method checks if the lookahead condition is satisfied based on the
 /// current match and the accept data.
 /// It returns a tuple containing a boolean indicating whether the lookahead is satisfied
 /// and the length of the lookahead match.
-fn evaluate_lookahead<F: FindMatchesTrait + Clone>(
+fn evaluate_lookahead<F: FindMatchesEval>(
     mut find_matches: F,
     accept_data: &crate::AcceptData,
 ) -> (bool, usize) {
@@ -371,7 +456,7 @@ fn evaluate_lookahead<F: FindMatchesTrait + Clone>(
 /// scanner implementation and the current position in the input.
 /// It is used in the `next` method of the `Iterator` trait implementation.
 #[inline(always)]
-pub(crate) fn next_match<F: FindMatchesTrait + Clone>(find_matches: &mut F) -> Option<Match> {
+pub(crate) fn next_match<F: FindMatchesEval>(find_matches: &mut F) -> Option<Match> {
     // Logic to find the next match in the input using the scanner implementation
     // and the current position in the char_iter.
     let dfa: &Dfa = find_matches.current_dfa();
@@ -396,10 +481,15 @@ pub(crate) fn next_match<F: FindMatchesTrait + Clone>(find_matches: &mut F) -> O
 ///
 /// If no match is found, None is returned.
 #[inline(always)]
-fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Option<Match> {
+fn find_next<F: FindMatchesEval>(find_matches: &mut F, dfa: &Dfa) -> Option<Match> {
     let mut state = 0; // Initial state of the DFA
     let mut match_start = MatchStart::default();
     let mut match_end = MatchEnd::default();
+    // Tracks the AcceptData that currently owns `match_end`, so the eventual
+    // winner's capture op (if any) can be committed once at the end.
+    // Invariant: `accepted_data.is_some() == end_set`.
+    #[cfg(feature = "dynamic-state")]
+    let mut accepted_data: Option<&crate::AcceptData> = None;
     let mut start_set = false;
     let mut end_set = false;
 
@@ -438,6 +528,17 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
                 };
             if lookahead_satisfied {
                 let new_byte_index = char_item.byte_index + char_item.ch.len_utf8();
+                // Reject candidates whose dynamic-state validate() does not hold
+                // before they enter longest-match comparison. Capture ops are
+                // not committed here; this is a read-only eligibility check.
+                #[cfg(feature = "dynamic-state")]
+                {
+                    let matched_text =
+                        find_matches.get_matched_text(match_start.byte_index, new_byte_index);
+                    if !find_matches.is_eligible_for(accept_data, matched_text) {
+                        continue;
+                    }
+                }
                 let new_len = new_byte_index - match_start.byte_index;
                 let update = !end_set || {
                     let old_len = match_end.byte_index - match_start.byte_index;
@@ -455,6 +556,12 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
                                 }
                             }));
                     end_set = true;
+                    // Keep `accepted_data` in sync with `match_end` so that a
+                    // later, longer match overrides any earlier capture op.
+                    #[cfg(feature = "dynamic-state")]
+                    {
+                        accepted_data = Some(accept_data);
+                    }
                     find_matches.save_char_iter();
                 }
                 // We found a satisfied lookahead for this state.
@@ -466,6 +573,14 @@ fn find_next<F: FindMatchesTrait + Clone>(find_matches: &mut F, dfa: &Dfa) -> Op
 
     if end_set {
         let span: crate::Span = match_start.byte_index..match_end.byte_index;
+        // Now that the longest/highest-priority match is fixed, run the
+        // capture op of the winning AcceptData (if any) exactly once. This is
+        // the only place that mutates the scanner's dynamic state.
+        #[cfg(feature = "dynamic-state")]
+        if let Some(accept_data) = accepted_data {
+            let matched_text = find_matches.get_matched_text(span.start, span.end);
+            find_matches.commit_capture(accept_data, matched_text);
+        }
         find_matches.restore_saved_char_iter();
         Some(
             Match::new(span, match_end.token_type).with_positions(

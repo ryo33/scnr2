@@ -34,11 +34,16 @@ pub mod character_classes;
 /// The dfa module contains the DFA implementation.
 pub mod dfa;
 
+#[cfg(feature = "dynamic-state")]
+pub mod dynamic;
+
 /// The codegen module contains the code generation logic for SCNR2.
 pub mod generate;
 
 /// The id module contains the ID types used in the SCNR2 generation.
 pub mod ids;
+
+mod keyword;
 
 /// Module that provides functions and types related to DFA minimization.
 pub mod minimizer;

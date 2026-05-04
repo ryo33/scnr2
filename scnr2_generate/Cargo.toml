@@ -18,6 +18,10 @@ regex-syntax = "0.8.10"
 rustc-hash = "2.1.2"
 syn = "2.0.117"
 
+[features]
+default = []
+dynamic-state = []
+
 [dev-dependencies]
 rstest = "0.26.1"
 tempfile = "3.27.0"

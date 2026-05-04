@@ -209,11 +209,11 @@ impl DfaState {
             });
             self.accept_data.dedup();
 
-            // Optimization: Truncate after the first Lookahead::None
+            // Optimization: truncate after the first candidate that cannot fail.
             if let Some(none_index) = self
                 .accept_data
                 .iter()
-                .position(|ad| matches!(ad.lookahead, Lookahead::None))
+                .position(Pattern::is_unconditional_accept)
             {
                 self.accept_data.truncate(none_index + 1);
             }

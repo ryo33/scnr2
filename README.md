@@ -10,10 +10,10 @@
 
 ## Key Advantages
 
-- **Blazing Fast:** All scanner logic is generated at compile time using Rust macros, resulting in zero-cost abstractions and exceptional runtime performance.
+- **Blazing Fast:** All scanner logic is generated at compile time using Rust macros, with no runtime regex engine in generated scanners.
 - **Ergonomic Macro Syntax:** Define scanners, modes, tokens, and transitions with concise, readable macros—no boilerplate required.
 - **Multi-Mode State Machines:** Effortlessly model complex lexing scenarios with built-in support for multiple scanner modes and seamless transitions (`set`, `push`, `pop`).
-- **Context-Sensitive Tokenization:** Specify positive/negative lookahead conditions for tokens, enabling powerful context-aware parsing.
+- **Context-Sensitive Tokenization:** Specify positive/negative lookahead conditions and, with the `dynamic-state` feature, scanner-instance state for tokens whose close delimiter depends on an earlier capture.
 - **Full Unicode & Regex Support:** Broad compatibility with Unicode and advanced regex features, including case insensitivity.
 - **Extensible & Contributor-Friendly:** Modular design and clear API make it easy to extend, customize, and contribute new features.
 - **Python Support:** Official Python bindings are available via the [scnr2](https://pypi.org/project/scnr2/) package on PyPI (`pip install scnr2`). See `scnr2-python` for details.
@@ -21,7 +21,7 @@
 ## Unique Value Propositions
 
 - **Compile-Time Safety:** Catch errors early and eliminate runtime surprises.
-- **Minimal Dependencies:** Lightweight footprint for easy integration into any Rust project.
+- **Minimal Dependencies:** Lightweight footprint for easy integration; generated scanner code does not depend on a runtime regex engine.
 - **Production-Ready:** Proven reliability, actively maintained, and well-documented.
 
 ## Quickstart Example
@@ -125,10 +125,54 @@ Tokens found: 17
 [79..81] tok 7 at 3:51-3:53: '*/'
 ```
 
+## Advanced Example: Context-Sensitive Tokenization (Rust raw strings)
+
+Enable the optional feature:
+
+```toml
+scnr2 = { version = "0.5.2", features = ["dynamic-state"] }
+```
+
+Rust raw strings close with exactly the same number of `#` characters used by the opener. That count is not a fixed regular language unless you choose a bound. `dynamic-state` keeps the scanner DFA generated at compile time and stores only the captured count in the scanner instance.
+
+```rust
+use scnr2::scanner;
+
+scanner! {
+    RawStringScanner {
+        state n: count(0..=16);
+
+        mode INITIAL {
+            token r"r" + capture("#", n) + r#"""# => 1;
+            token r"\s+" => 98;
+            token r"." => 99;
+
+            on 1 enter RAW;
+        }
+
+        mode RAW {
+            token r#"[^"]*"# => 10;
+            token r#"""# + validate("#", n) => 20;
+            token r#"""# + validate("#", n, 0..n) => 10;
+
+            on 20 enter INITIAL;
+        }
+    }
+}
+```
+
+- `state n: count(0..=16);` declares one scanner-instance state slot. The bound keeps all generated automata finite.
+- `capture("#", n)` matches zero to sixteen `#` units and stores the matched unit count in state slot `n` after the token is finally selected.
+- `validate("#", n)` accepts only when the matched count equals the stored count.
+- `validate("#", n, 0..n)` accepts partial closes, such as `"#` inside an `r##"..."##` raw string, without consuming the final close.
+
+Dynamic state persists across `find_matches` calls on the same scanner and is not reset by mode transitions. Call `reset_dynamic_state()` when you want to clear captured values explicitly.
+
 ## Advanced Features
 
 - **Mode Switching:** Build nested, stateful scanners with `push`, `enter`, and `pop` transitions.
 - **Lookahead:** Use `followed by` and `not followed by` for context-sensitive tokens.
+- **Dynamic State:** With the `dynamic-state` feature, use bounded `count` or regex-shaped `str` state to implement context-sensitive delimiters without runtime regex matching.
 - **Unicode:** Full Unicode support for internationalization.
 - **Performance:** Compile-time generation ensures optimal speed.
 

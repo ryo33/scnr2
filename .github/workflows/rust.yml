@@ -17,9 +17,18 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            features: ""
+          - name: dynamic-state
+            features: "--features scnr2/dynamic-state,tests/dynamic-state"
+
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Build (${{ matrix.name }})
+      run: cargo build --workspace --no-default-features ${{ matrix.features }} --verbose
+    - name: Run tests (${{ matrix.name }})
+      run: cargo test --workspace --no-default-features ${{ matrix.features }} --verbose

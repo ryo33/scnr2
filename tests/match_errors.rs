@@ -159,6 +159,11 @@ fn test_boundary_conditions() {
         !matches_middle.is_empty(),
         "Should find matches from middle"
     );
+    let middle_count = matches_middle.iter().filter(|m| m.token_type == 2).count();
+    assert_eq!(
+        middle_count, 2,
+        "scanning from offset 4 of \"abc def ghi\" must yield exactly 2 identifiers (def, ghi)"
+    );
 
     // Scan from near end
     let _matches_end: Vec<_> = scanner.find_matches(input, input.len() - 1).collect();

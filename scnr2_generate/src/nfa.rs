@@ -760,7 +760,9 @@ mod tests {
                 pattern: r"\d{4}-\d{2}-\d{2}".to_string(),
                 terminal_type: 1.into(),
                 priority: 0,
-                lookahead: Lookahead::None
+                lookahead: Lookahead::None,
+                #[cfg(feature = "dynamic-state")]
+                dynamic: None,
             })
         );
         assert_eq!(
@@ -769,7 +771,9 @@ mod tests {
                 pattern: r"\w+".to_string(),
                 terminal_type: 2.into(),
                 priority: 1,
-                lookahead: Lookahead::None
+                lookahead: Lookahead::None,
+                #[cfg(feature = "dynamic-state")]
+                dynamic: None,
             })
         );
         // There should be one accepting state for each pattern

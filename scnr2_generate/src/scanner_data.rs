@@ -1,5 +1,9 @@
 use syn::braced;
 
+#[cfg(feature = "dynamic-state")]
+use crate::dynamic::{
+    StateDeclaration, StateType, build_dynamic_pattern, ensure_no_capturing_groups,
+};
 use crate::{pattern::Pattern, scanner_mode::ScannerMode};
 
 macro_rules! parse_ident {
@@ -90,13 +94,11 @@ impl Eq for TransitionToNumericMode {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransitionToNamedMode {
     /// A transition to a new scanner mode triggered by a token type number.
-    /// The first element is the token type number, and the second element is the new scanner mode name.
-    /// This transition is used to set the current scanner mode.
-    SetMode(usize, String),
-    /// A transition to a new scanner mode triggered by a token type number.
-    /// The first element is the token type number, and the second element is the new scanner mode name.
-    /// This transition is used to push the current mode on the mode stack o be able to return to it later.
-    PushMode(usize, String),
+    /// The second element is the original `syn::Ident` of the target mode so
+    /// that diagnostics for unknown modes can point at the source span.
+    SetMode(usize, syn::Ident),
+    /// A push transition; same span-preservation rationale as `SetMode`.
+    PushMode(usize, syn::Ident),
     /// A transition back to a formerly pushed scanner mode triggered by a token type number.
     /// This transition is used to pop the current scanner mode from the stack.
     PopMode(usize),
@@ -117,28 +119,35 @@ pub struct ScannerModeWithNamedTransitions {
     pub(crate) transitions: Vec<TransitionToNamedMode>,
 }
 
+fn resolve_mode(scanner_names: &[&str], target: &syn::Ident) -> syn::Result<usize> {
+    let target_str = target.to_string();
+    scanner_names
+        .iter()
+        .position(|name| *name == target_str)
+        .ok_or_else(|| {
+            syn::Error::new(
+                target.span(),
+                format!("scanner mode '{target_str}' not found"),
+            )
+        })
+}
+
 impl ScannerModeWithNamedTransitions {
     /// Converts the scanner mode with named transitions to a scanner mode with numeric transitions.
     /// Returns a vector of tuples of the token type numbers and the new scanner mode ID.
     pub(crate) fn convert_transitions(
         &self,
         scanner_names: &[&str],
-    ) -> Vec<TransitionToNumericMode> {
+    ) -> syn::Result<Vec<TransitionToNumericMode>> {
         let mut transitions = Vec::new();
         for transition in &self.transitions {
             match transition {
                 TransitionToNamedMode::SetMode(token_type, new_mode) => {
-                    let new_mode_id = scanner_names
-                        .iter()
-                        .position(|name| name == new_mode)
-                        .unwrap_or_else(|| panic!("Scanner mode '{new_mode}' not found"));
+                    let new_mode_id = resolve_mode(scanner_names, new_mode)?;
                     transitions.push(TransitionToNumericMode::SetMode(*token_type, new_mode_id));
                 }
                 TransitionToNamedMode::PushMode(token_type, new_mode) => {
-                    let new_mode_id = scanner_names
-                        .iter()
-                        .position(|name| name == new_mode)
-                        .unwrap_or_else(|| panic!("Scanner mode '{new_mode}' not found"));
+                    let new_mode_id = resolve_mode(scanner_names, new_mode)?;
                     transitions.push(TransitionToNumericMode::PushMode(*token_type, new_mode_id));
                 }
                 TransitionToNamedMode::PopMode(token_type) => {
@@ -151,7 +160,7 @@ impl ScannerModeWithNamedTransitions {
             | TransitionToNumericMode::PushMode(token_type, _)
             | TransitionToNumericMode::PopMode(token_type) => *token_type,
         });
-        transitions
+        Ok(transitions)
     }
 }
 
@@ -209,18 +218,10 @@ impl syn::parse::Parse for ScannerModeWithNamedTransitions {
                 match transition_kind.to_string().as_str() {
                     "enter" => {
                         let new_mode: syn::Ident = parse_ident!(content, new_mode);
-                        let new_mode = new_mode.to_string();
-                        if new_mode.is_empty() {
-                            return Err(content.error("expected a mode name"));
-                        }
                         transitions.push(TransitionToNamedMode::SetMode(token_type, new_mode));
                     }
                     "push" => {
                         let new_mode: syn::Ident = parse_ident!(content, new_mode);
-                        let new_mode = new_mode.to_string();
-                        if new_mode.is_empty() {
-                            return Err(content.error("expected a mode name"));
-                        }
                         transitions.push(TransitionToNamedMode::PushMode(token_type, new_mode));
                     }
                     "pop" => {
@@ -252,6 +253,8 @@ impl syn::parse::Parse for ScannerModeWithNamedTransitions {
 pub struct ScannerData {
     /// The scanner name.
     pub name: String,
+    #[cfg(feature = "dynamic-state")]
+    pub states: Vec<StateDeclaration>,
     /// The scanner modes.
     pub modes: Vec<ScannerModeWithNamedTransitions>,
 }
@@ -263,14 +266,118 @@ impl ScannerData {
             .iter()
             .map(|mode| mode.name.as_str())
             .collect::<Vec<_>>();
+        #[cfg(feature = "dynamic-state")]
+        let state_map = self
+            .states
+            .iter()
+            .map(|state| (state.name.as_str(), state.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
         for mode in &self.modes {
-            let transitions = mode.convert_transitions(&scanner_names);
-            let scanner_mode = ScannerMode::new(&mode.name, mode.patterns.clone(), transitions);
+            let transitions = mode.convert_transitions(&scanner_names)?;
+            #[cfg(feature = "dynamic-state")]
+            let patterns = mode
+                .patterns
+                .iter()
+                .map(|pattern| self.resolve_dynamic_pattern(pattern, &state_map))
+                .collect::<syn::Result<Vec<_>>>()?;
+            #[cfg(not(feature = "dynamic-state"))]
+            let patterns = mode.patterns.clone();
+            let scanner_mode = ScannerMode::new(&mode.name, patterns, transitions);
             scanner_modes.push(scanner_mode);
             scanner_names.push(&mode.name);
         }
         Ok(scanner_modes)
     }
+
+    #[cfg(feature = "dynamic-state")]
+    fn resolve_dynamic_pattern(
+        &self,
+        pattern: &Pattern,
+        state_map: &std::collections::HashMap<&str, StateDeclaration>,
+    ) -> syn::Result<Pattern> {
+        let Some(unresolved) = pattern.unresolved() else {
+            return Ok(pattern.clone());
+        };
+        let (regex, dynamic) =
+            build_dynamic_pattern(unresolved, |name| state_map.get(name).cloned())?;
+        let mut resolved = pattern.clone();
+        resolved.pattern = regex;
+        Ok(resolved.with_dynamic(dynamic))
+    }
+}
+
+#[cfg(feature = "dynamic-state")]
+fn parse_state_declaration(
+    content: &syn::parse::ParseBuffer,
+    index: usize,
+) -> syn::Result<StateDeclaration> {
+    let name: syn::Ident = parse_ident!(content, state_name);
+    let name = name.to_string();
+    if name.is_empty() {
+        return Err(content.error("expected a state name"));
+    }
+    content.parse::<syn::Token![:]>()?;
+
+    let type_name: syn::Ident = parse_ident!(content, type_name);
+    let state_type = match type_name.to_string().as_str() {
+        "count" => {
+            let paren_content;
+            syn::parenthesized!(paren_content in content);
+            let min: syn::LitInt = paren_content
+                .parse()
+                .map_err(|_| paren_content.error("state range must use literal integers only"))?;
+            let min = min.base10_parse::<usize>()?;
+            paren_content.parse::<syn::Token![..]>()?;
+            let inclusive = paren_content.peek(syn::Token![=]);
+            if inclusive {
+                paren_content.parse::<syn::Token![=]>()?;
+            }
+            let max: syn::LitInt = paren_content
+                .parse()
+                .map_err(|_| paren_content.error("state range must use literal integers only"))?;
+            let max = max.base10_parse::<usize>()?;
+            if !paren_content.is_empty() {
+                return Err(paren_content.error("unexpected tokens in count state range"));
+            }
+            let max = if inclusive {
+                if min > max {
+                    return Err(paren_content.error("state range must satisfy min <= max"));
+                }
+                max
+            } else {
+                if min >= max {
+                    return Err(paren_content.error("state range must satisfy min < max"));
+                }
+                max - 1
+            };
+            StateType::Count { min, max }
+        }
+        "str" => {
+            let paren_content;
+            syn::parenthesized!(paren_content in content);
+            let pattern: syn::LitStr = paren_content.parse()?;
+            if !paren_content.is_empty() {
+                return Err(paren_content.error("str state takes exactly one regex pattern"));
+            }
+            ensure_no_capturing_groups(&pattern.value(), pattern.span())?;
+            StateType::Str {
+                pattern: pattern.value(),
+            }
+        }
+        _ => {
+            return Err(syn::Error::new(
+                type_name.span(),
+                "expected 'count' or 'str'",
+            ));
+        }
+    };
+
+    content.parse::<syn::Token![;]>()?;
+    Ok(StateDeclaration {
+        name,
+        index,
+        state_type,
+    })
 }
 
 /// This is used to create a scanner from a part of a macro input.
@@ -288,15 +395,60 @@ impl syn::parse::Parse for ScannerData {
         }
         let content;
         braced!(content in input);
+        #[cfg(feature = "dynamic-state")]
+        let mut states = Vec::new();
         let mut modes = Vec::new();
-        // Parse at least one scanner mode
-        let initial_mode: ScannerModeWithNamedTransitions = content.parse()?;
-        modes.push(initial_mode);
+
         while !content.is_empty() {
-            let mode: ScannerModeWithNamedTransitions = content.parse()?;
-            modes.push(mode);
+            let lookahead = content.lookahead1();
+            if !lookahead.peek(syn::Ident) {
+                return Err(lookahead.error());
+            }
+            let fork = content.fork();
+            let ident: syn::Ident = fork.parse()?;
+            match ident.to_string().as_str() {
+                "state" => {
+                    #[cfg(not(feature = "dynamic-state"))]
+                    {
+                        return Err(syn::Error::new(
+                            ident.span(),
+                            "state declarations require enabling the `dynamic-state` feature on scnr2",
+                        ));
+                    }
+                    #[cfg(feature = "dynamic-state")]
+                    {
+                        let _: syn::Ident = parse_ident!(content, state);
+                        let state = parse_state_declaration(&content, states.len())?;
+                        if states
+                            .iter()
+                            .any(|existing: &StateDeclaration| existing.name == state.name)
+                        {
+                            return Err(syn::Error::new(
+                                ident.span(),
+                                format!("state '{}' is declared more than once", state.name),
+                            ));
+                        }
+                        states.push(state);
+                    }
+                }
+                "mode" => {
+                    let mode: ScannerModeWithNamedTransitions = content.parse()?;
+                    modes.push(mode);
+                }
+                _ => return Err(content.error("expected 'state' or 'mode'")),
+            }
         }
-        Ok(ScannerData { name, modes })
+
+        if modes.is_empty() {
+            return Err(content.error("expected at least one mode"));
+        }
+
+        Ok(ScannerData {
+            name,
+            #[cfg(feature = "dynamic-state")]
+            states,
+            modes,
+        })
     }
 }
 
@@ -344,7 +496,10 @@ mod tests {
         assert_eq!(mode_initial.patterns.len(), 11);
         assert_eq!(mode_initial.transitions.len(), 1);
         assert_eq!(
-            TransitionToNamedMode::SetMode(8, "STRING".to_string()),
+            TransitionToNamedMode::SetMode(
+                8,
+                syn::Ident::new("STRING", proc_macro2::Span::call_site())
+            ),
             mode_initial.transitions[0]
         );
         let mode_initial_patterns = &mode_initial.patterns;
@@ -393,7 +548,10 @@ mod tests {
         assert_eq!(mode_string.patterns.len(), 5);
         assert_eq!(mode_string.transitions.len(), 1);
         assert_eq!(
-            TransitionToNamedMode::SetMode(8, "INITIAL".to_string()),
+            TransitionToNamedMode::SetMode(
+                8,
+                syn::Ident::new("INITIAL", proc_macro2::Span::call_site())
+            ),
             mode_string.transitions[0]
         );
         let mode_string_patterns = &mode_string.patterns;
@@ -412,5 +570,127 @@ mod tests {
         assert_eq!(mode_string_patterns[2].lookahead, Lookahead::None);
         assert_eq!(mode_string_patterns[3].lookahead, Lookahead::None);
         assert_eq!(mode_string_patterns[4].lookahead, Lookahead::None);
+    }
+
+    #[test]
+    #[cfg(not(feature = "dynamic-state"))]
+    fn test_dynamic_state_dsl_reports_feature_error_when_disabled() {
+        let input = quote::quote! {
+            DisabledScanner {
+                state n: count(0..=4);
+                mode INITIAL {
+                    token r"." => 99;
+                }
+            }
+        };
+        let error = syn::parse2::<ScannerData>(input).unwrap_err();
+        assert!(error.to_string().contains("dynamic-state"));
+
+        let input = quote::quote! {
+            DisabledScanner {
+                mode INITIAL {
+                    token capture("#", n) => 1;
+                }
+            }
+        };
+        let error = syn::parse2::<ScannerData>(input).unwrap_err();
+        assert!(error.to_string().contains("dynamic-state"));
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_dynamic_state_rejects_undeclared_state() {
+        let input = quote::quote! {
+            BadScanner {
+                mode INITIAL {
+                    token capture("#", n) => 1;
+                }
+            }
+        };
+        let scanner_data: ScannerData = syn::parse2(input).unwrap();
+        let error = scanner_data.build_scanner_modes().unwrap_err();
+        assert!(error.to_string().contains("not declared"));
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_dynamic_state_rejects_type_mismatch() {
+        let input = quote::quote! {
+            BadScanner {
+                state marker: str(r"[A-Z]+");
+                mode INITIAL {
+                    token capture("#", marker) => 1;
+                }
+            }
+        };
+        let scanner_data: ScannerData = syn::parse2(input).unwrap();
+        let error = scanner_data.build_scanner_modes().unwrap_err();
+        assert!(error.to_string().contains("declared as str"));
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_dynamic_state_rejects_open_ended_range() {
+        let input = quote::quote! {
+            BadScanner {
+                state n: count(0..=4);
+                mode INITIAL {
+                    token validate("#", n, ..n) => 1;
+                }
+            }
+        };
+        let error = syn::parse2::<ScannerData>(input).unwrap_err();
+        assert!(error.to_string().contains("open-ended"));
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_dynamic_state_rejects_capturing_groups() {
+        let input = quote::quote! {
+            BadScanner {
+                state n: count(0..=4);
+                mode INITIAL {
+                    token r"(ab)+" + capture("#", n) => 1;
+                }
+            }
+        };
+        let scanner_data: ScannerData = syn::parse2(input).unwrap();
+        let error = scanner_data.build_scanner_modes().unwrap_err();
+        assert!(error.to_string().contains("capturing groups"));
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_dynamic_state_rejects_duplicate_state_ops() {
+        let input = quote::quote! {
+            BadScanner {
+                state n: count(0..=4);
+                mode INITIAL {
+                    token capture("#", n) + validate("#", n) => 1;
+                }
+            }
+        };
+        let error = syn::parse2::<ScannerData>(input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only one capture() or validate()")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dynamic-state")]
+    fn test_dynamic_state_rejects_duplicate_state_declaration() {
+        let input = quote::quote! {
+            BadScanner {
+                state n: count(0..=4);
+                state n: count(0..=8);
+                mode INITIAL {
+                    token r"." => 99;
+                }
+            }
+        };
+        let error = syn::parse2::<ScannerData>(input).unwrap_err();
+        assert!(error.to_string().contains("declared more than once"));
     }
 }
