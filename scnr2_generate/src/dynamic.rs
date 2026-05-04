@@ -35,6 +35,10 @@ pub enum CompileTimeExpr {
 pub enum CompileTimeConstraint {
     Equals,
     LessThan,
+    OpenRange {
+        min: Option<CompileTimeExpr>,
+        max_exclusive: Option<CompileTimeExpr>,
+    },
     Range {
         min: CompileTimeExpr,
         max_exclusive: CompileTimeExpr,
@@ -194,6 +198,9 @@ impl ToTokens for CompileTimeConstraint {
         let guard = match self {
             CompileTimeConstraint::Equals => quote! { DynamicGuard::Equal },
             CompileTimeConstraint::LessThan => quote! { DynamicGuard::LessThan },
+            CompileTimeConstraint::OpenRange { .. } => {
+                quote! { compile_error!("internal error: unresolved open-ended dynamic range") }
+            }
             CompileTimeConstraint::Range { min, max_exclusive } => {
                 quote! {
                     DynamicGuard::Range {
@@ -372,23 +379,35 @@ pub fn parse_capture_or_validate(input: syn::parse::ParseStream) -> syn::Result<
 
 const CONSTRAINT_EXPR_ERROR: &str =
     "constraint expression must be 'n', a literal, or simple arithmetic";
-const OPEN_ENDED_RANGE_ERROR: &str = "open-ended ranges (..n or n..) are not supported";
 
 fn parse_constraint(input: syn::parse::ParseStream) -> syn::Result<CompileTimeConstraint> {
     if input.peek(syn::Token![..]) {
-        return Err(input.error(OPEN_ENDED_RANGE_ERROR));
+        input.parse::<syn::Token![..]>()?;
+        let max_exclusive = if input.is_empty() {
+            None
+        } else {
+            Some(parse_constraint_expr(input)?)
+        };
+        return Ok(CompileTimeConstraint::OpenRange {
+            min: None,
+            max_exclusive,
+        });
     }
     let first = parse_constraint_expr(input)?;
     if input.peek(syn::Token![..]) {
         input.parse::<syn::Token![..]>()?;
         if input.is_empty() {
-            return Err(input.error(OPEN_ENDED_RANGE_ERROR));
+            Ok(CompileTimeConstraint::OpenRange {
+                min: Some(first),
+                max_exclusive: None,
+            })
+        } else {
+            let second = parse_constraint_expr(input)?;
+            Ok(CompileTimeConstraint::Range {
+                min: first,
+                max_exclusive: second,
+            })
         }
-        let second = parse_constraint_expr(input)?;
-        Ok(CompileTimeConstraint::Range {
-            min: first,
-            max_exclusive: second,
-        })
     } else {
         match first {
             CompileTimeExpr::State => Ok(CompileTimeConstraint::Equals),
@@ -557,6 +576,12 @@ fn resolve_validate(
         .ok_or_else(|| syn::Error::new(span, format!("state '{state_name}' is not declared")))?;
     match (unit_or_none, state.state_type) {
         (Some(unit), StateType::Count { min, max }) => {
+            let guard = normalize_count_constraint(
+                constraint.unwrap_or(CompileTimeConstraint::Equals),
+                min,
+                max,
+                span,
+            )?;
             let segment = bounded_count_regex(unit, min, max);
             Ok((
                 segment,
@@ -566,7 +591,7 @@ fn resolve_validate(
                     unit: unit.to_string(),
                     min,
                     max,
-                    guard: constraint.unwrap_or(CompileTimeConstraint::Equals),
+                    guard,
                 },
             ))
         }
@@ -593,6 +618,29 @@ fn resolve_validate(
             span,
             format!("state '{state_name}' is declared as count, but used as str"),
         )),
+    }
+}
+
+fn normalize_count_constraint(
+    constraint: CompileTimeConstraint,
+    state_min: usize,
+    state_max: usize,
+    span: Span,
+) -> syn::Result<CompileTimeConstraint> {
+    match constraint {
+        CompileTimeConstraint::OpenRange { min, max_exclusive } => {
+            let state_max_exclusive = state_max.checked_add(1).ok_or_else(|| {
+                syn::Error::new(
+                    span,
+                    "open-ended range cannot use a count state whose max is usize::MAX",
+                )
+            })?;
+            Ok(CompileTimeConstraint::Range {
+                min: min.unwrap_or(CompileTimeExpr::Lit(state_min)),
+                max_exclusive: max_exclusive.unwrap_or(CompileTimeExpr::Lit(state_max_exclusive)),
+            })
+        }
+        other => Ok(other),
     }
 }
 
@@ -768,6 +816,36 @@ mod tests {
             build_dynamic_pattern(&unresolved, lookup(vec![count_state("n", 0, 0, 4)])).unwrap();
         match compiled.op {
             DynamicOp::ValidateCount { guard: actual, .. } => assert_eq!(actual, guard),
+            other => panic!("expected ValidateCount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_dynamic_pattern_validate_count_closes_open_range_with_state_bounds() {
+        let guard = CompileTimeConstraint::OpenRange {
+            min: None,
+            max_exclusive: None,
+        };
+        let unresolved = UnresolvedDynamicPattern {
+            segments: vec![DynamicSegment::Validate {
+                pattern: Some("#".to_string()),
+                state_name: "n".to_string(),
+                constraint: Some(guard),
+                span: Span::call_site(),
+            }],
+        };
+        let (_, compiled) =
+            build_dynamic_pattern(&unresolved, lookup(vec![count_state("n", 0, 2, 4)])).unwrap();
+        match compiled.op {
+            DynamicOp::ValidateCount { guard, .. } => {
+                assert_eq!(
+                    guard,
+                    CompileTimeConstraint::Range {
+                        min: CompileTimeExpr::Lit(2),
+                        max_exclusive: CompileTimeExpr::Lit(5),
+                    }
+                );
+            }
             other => panic!("expected ValidateCount, got {other:?}"),
         }
     }

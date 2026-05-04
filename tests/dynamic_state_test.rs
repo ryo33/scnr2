@@ -595,6 +595,62 @@ fn test_misordered_validates_shadow_each_other() {
     assert_eq!(&input[matches[1].span.clone()], "X##");
 }
 
+scanner! {
+    OpenEndedRangeScanner {
+        state n: count(1..=4);
+
+        mode INITIAL {
+            token r"A" + capture("#", n) + r"B" => 1;
+            token r"." => 99;
+            on 1 enter CHECK;
+        }
+
+        mode CHECK {
+            token r"L" + validate("#", n, ..n) => 2;
+            token r"U" + validate("#", n, n..) => 3;
+            token r"W" + validate("#", n, ..) => 4;
+            token r"." => 99;
+            on 2 enter INITIAL;
+            on 3 enter INITIAL;
+            on 4 enter INITIAL;
+            on 99 enter INITIAL;
+        }
+    }
+}
+
+#[test]
+fn test_open_ended_validate_range_allows_lower_open_bound() {
+    let input = "A###BL##";
+    let scanner = open_ended_range_scanner::OpenEndedRangeScanner::new();
+    let matches: Vec<Match> = scanner.find_matches(input, 0).collect();
+
+    assert_eq!(matches[0].token_type, 1);
+    assert_eq!(matches[1].token_type, 2);
+    assert_eq!(&input[matches[1].span.clone()], "L##");
+}
+
+#[test]
+fn test_open_ended_validate_range_allows_upper_open_bound() {
+    let input = "A##BU####";
+    let scanner = open_ended_range_scanner::OpenEndedRangeScanner::new();
+    let matches: Vec<Match> = scanner.find_matches(input, 0).collect();
+
+    assert_eq!(matches[0].token_type, 1);
+    assert_eq!(matches[1].token_type, 3);
+    assert_eq!(&input[matches[1].span.clone()], "U####");
+}
+
+#[test]
+fn test_open_ended_validate_range_allows_full_state_range() {
+    let input = "A###BW#";
+    let scanner = open_ended_range_scanner::OpenEndedRangeScanner::new();
+    let matches: Vec<Match> = scanner.find_matches(input, 0).collect();
+
+    assert_eq!(matches[0].token_type, 1);
+    assert_eq!(matches[1].token_type, 4);
+    assert_eq!(&input[matches[1].span.clone()], "W#");
+}
+
 // For "abccbc" two equal-width capture splits exist: "bc" at byte 1..3 and
 // "cc" at byte 2..4. The earliest one must win.
 scanner! {

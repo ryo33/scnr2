@@ -165,6 +165,7 @@ scanner! {
 - `capture("#", n)` matches zero to sixteen `#` units and stores the matched unit count in state slot `n` after the token is finally selected.
 - `validate("#", n)` accepts only when the matched count equals the stored count.
 - `validate("#", n, 0..n)` accepts partial closes, such as `"#` inside an `r##"..."##` raw string, without consuming the final close.
+- Open-ended constraints use the declared count-state bounds: `..n` means `state_min..n`, `n..` means `n..state_max + 1`, and `..` means the full declared state range.
 
 Dynamic state persists across `find_matches` calls on the same scanner and is not reset by mode transitions. Call `reset_dynamic_state()` when you want to clear captured values explicitly.
 
