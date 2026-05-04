@@ -810,7 +810,8 @@ mod tests {
             }],
         };
         let (full_regex, compiled) =
-            build_dynamic_pattern(&unresolved, lookup(vec![str_state("tag", 1, "[A-Z]+")])).unwrap();
+            build_dynamic_pattern(&unresolved, lookup(vec![str_state("tag", 1, "[A-Z]+")]))
+                .unwrap();
 
         assert_eq!(full_regex, "(?:[A-Z]+)");
         assert_eq!(compiled.capture_regex.as_deref(), Some("[A-Z]+"));

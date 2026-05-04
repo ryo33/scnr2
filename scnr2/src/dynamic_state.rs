@@ -131,6 +131,19 @@ impl DynamicPattern {
         }
     }
 
+    // The three `extract_*` helpers all follow the same shape:
+    //   1. iterate every prefix split (byte position where the prefix DFA accepts),
+    //   2. enumerate candidate segment ends inside the matched text — the middle's
+    //      structure is what differs between the three:
+    //        * extract_count          : `unit` repeated some count in [min, max]
+    //        * extract_str_capture    : a substring accepted by `self.capture` DFA
+    //        * extract_str_validation : the byte string `stored` literally,
+    //   3. keep candidates whose remainder is consumed exactly by the suffix DFA,
+    //   4. reduce (widest middle wins for capture/count; any one fit wins for validation).
+    //
+    // Direct slicing (`text[i..]`) is sound here because every byte index comes
+    // from `accepted_end_positions`, whose results land on `char_indices`
+    // boundaries by construction, and `unit`/`stored` are themselves valid `&str`s.
     fn extract_count<F>(
         &self,
         matched_text: &str,
@@ -146,36 +159,27 @@ impl DynamicPattern {
             return None;
         }
 
-        let mut best: Option<(usize, usize)> = None;
-        for prefix_end in accepted_end_positions(&self.prefix, matched_text, class_for) {
-            let mut positions = Vec::new();
-            let mut next = prefix_end;
-            positions.push((0, next));
-            for count in 1..=max {
-                let tail = matched_text.get(next..)?;
-                if !tail.starts_with(unit) {
-                    break;
+        accepted_end_positions(&self.prefix, matched_text, class_for)
+            .into_iter()
+            .flat_map(|prefix_end| {
+                // How many `unit`s line up at `prefix_end`, capped at `max`.
+                let mut units_fitting = 0;
+                let mut scan = prefix_end;
+                while units_fitting < max && matched_text[scan..].starts_with(unit) {
+                    units_fitting += 1;
+                    scan += unit.len();
                 }
-                next += unit.len();
-                positions.push((count, next));
-            }
-
-            for (count, segment_end) in positions.into_iter().rev() {
-                if count < min {
-                    continue;
-                }
-                let suffix = matched_text.get(segment_end..)?;
-                if !dfa_matches_exact(&self.suffix, suffix, class_for) {
-                    continue;
-                }
-                let width = segment_end.saturating_sub(prefix_end);
-                if best.is_none_or(|(_, best_width)| width > best_width) {
-                    best = Some((count, width));
-                }
-                break;
-            }
-        }
-        best.map(|(count, _)| count)
+                // Every count in [min, units_fitting] is a candidate; the suffix
+                // filter below decides which actually fit.
+                (min..=units_fitting).map(move |count| (count, prefix_end + count * unit.len()))
+            })
+            .filter(|&(_, segment_end)| {
+                dfa_matches_exact(&self.suffix, &matched_text[segment_end..], class_for)
+            })
+            // All units share the same byte length, so the largest count is also
+            // the longest capture.
+            .max_by_key(|&(count, _)| count)
+            .map(|(count, _)| count)
     }
 
     fn extract_str_capture<'a, F>(&self, matched_text: &'a str, class_for: F) -> Option<&'a str>
@@ -183,24 +187,23 @@ impl DynamicPattern {
         F: Fn(char) -> Option<usize> + Copy,
     {
         let capture = self.capture.as_ref()?;
-        let mut best: Option<(usize, usize)> = None;
 
-        for prefix_end in accepted_end_positions(&self.prefix, matched_text, class_for) {
-            let tail = matched_text.get(prefix_end..)?;
-            for relative_end in accepted_end_positions(capture, tail, class_for) {
-                let segment_end = prefix_end + relative_end;
-                let suffix = matched_text.get(segment_end..)?;
-                if !dfa_matches_exact(&self.suffix, suffix, class_for) {
-                    continue;
-                }
-                let width = segment_end.saturating_sub(prefix_end);
-                if best.is_none_or(|(_, best_width)| width > best_width) {
-                    best = Some((prefix_end, segment_end));
-                }
-            }
-        }
-
-        best.and_then(|(start, end)| matched_text.get(start..end))
+        accepted_end_positions(&self.prefix, matched_text, class_for)
+            .into_iter()
+            .flat_map(|prefix_end| {
+                // Every byte position where the capture DFA accepts inside the
+                // slice after the prefix is a candidate end of the capture.
+                accepted_end_positions(capture, &matched_text[prefix_end..], class_for)
+                    .into_iter()
+                    .map(move |relative_end| (prefix_end, prefix_end + relative_end))
+            })
+            .filter(|&(_, segment_end)| {
+                dfa_matches_exact(&self.suffix, &matched_text[segment_end..], class_for)
+            })
+            // Unlike count, capture widths can differ between splits; pick the
+            // widest substring.
+            .max_by_key(|&(start, end)| end - start)
+            .map(|(start, end)| &matched_text[start..end])
     }
 
     fn extract_str_validation<F>(
@@ -212,21 +215,18 @@ impl DynamicPattern {
     where
         F: Fn(char) -> Option<usize> + Copy,
     {
-        for prefix_end in accepted_end_positions(&self.prefix, matched_text, class_for) {
-            let tail = matched_text.get(prefix_end..)?;
-            if !tail.starts_with(stored) {
-                continue;
-            }
-            let suffix_start = prefix_end + stored.len();
-            if !matched_text.is_char_boundary(suffix_start) {
-                continue;
-            }
-            let suffix = matched_text.get(suffix_start..)?;
-            if dfa_matches_exact(&self.suffix, suffix, class_for) {
-                return Some(());
-            }
-        }
-        None
+        accepted_end_positions(&self.prefix, matched_text, class_for)
+            .into_iter()
+            // The middle must be `stored` exactly, so each prefix split has at
+            // most one segment end to consider.
+            .filter(|&prefix_end| matched_text[prefix_end..].starts_with(stored))
+            // Validation only needs *some* split that the suffix DFA consumes
+            // exactly; there is nothing to optimize across splits.
+            .any(|prefix_end| {
+                let segment_end = prefix_end + stored.len();
+                dfa_matches_exact(&self.suffix, &matched_text[segment_end..], class_for)
+            })
+            .then_some(())
     }
 }
 
