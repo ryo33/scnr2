@@ -1,0 +1,5 @@
+error: open-ended ranges (..n or n..) are not supported
+ --> compile_fail/with_feature/open_ended_range.rs:7:36
+  |
+7 |             token validate("#", n, ..n) => 1;
+  |                                    ^

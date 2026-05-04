@@ -1,0 +1,5 @@
+error: only one capture() or validate() is allowed per pattern
+ --> compile_fail/with_feature/duplicate_state_ops.rs:7:37
+  |
+7 |             token capture("#", n) + validate("#", n) => 1;
+  |                                     ^^^^^^^^

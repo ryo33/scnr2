@@ -1,0 +1,5 @@
+error: state 'n' is not declared
+ --> compile_fail/with_feature/undeclared_state.rs:6:19
+  |
+6 |             token capture("#", n) => 1;
+  |                   ^^^^^^^

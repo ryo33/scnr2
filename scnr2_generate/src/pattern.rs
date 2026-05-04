@@ -434,18 +434,22 @@ fn parse_pattern_dynamic_enabled(input: syn::parse::ParseStream) -> syn::Result<
         return Err(input.error("expected ';'"));
     }
 
-    let dynamic_op_count = segments
+    let op_spans: Vec<proc_macro2::Span> = segments
         .iter()
-        .filter(|segment| {
-            matches!(
-                segment,
-                DynamicSegment::Capture { .. } | DynamicSegment::Validate { .. }
-            )
+        .filter_map(|segment| match segment {
+            DynamicSegment::Capture { span, .. } | DynamicSegment::Validate { span, .. } => {
+                Some(*span)
+            }
+            DynamicSegment::Regex { .. } => None,
         })
-        .count();
-    if dynamic_op_count > 1 {
-        return Err(input.error("only one capture() or validate() is allowed per pattern"));
+        .collect();
+    if let [_, extra, ..] = op_spans.as_slice() {
+        return Err(syn::Error::new(
+            *extra,
+            "only one capture() or validate() is allowed per pattern",
+        ));
     }
+    let has_op = !op_spans.is_empty();
 
     let pattern_string = segments
         .iter()
@@ -456,7 +460,7 @@ fn parse_pattern_dynamic_enabled(input: syn::parse::ParseStream) -> syn::Result<
         .collect::<String>();
     let mut pattern = Pattern::new(pattern_string, token_type.into())
         .with_lookahead(lookahead.unwrap_or(Lookahead::None));
-    if dynamic_op_count == 1 {
+    if has_op {
         pattern = pattern.with_unresolved_dynamic(UnresolvedDynamicPattern { segments });
     }
     Ok(pattern)

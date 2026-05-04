@@ -1,0 +1,5 @@
+error: state declarations require enabling the `dynamic-state` feature on scnr2
+ --> compile_fail/without_feature/feature_off_state_decl.rs:5:9
+  |
+5 |         state n: count(0..=4);
+  |         ^^^^^

@@ -1,0 +1,5 @@
+error: capture()/validate() requires enabling the `dynamic-state` feature on scnr2
+ --> compile_fail/without_feature/feature_off_capture.rs:6:19
+  |
+6 |             token capture("#", n) => 1;
+  |                   ^^^^^^^

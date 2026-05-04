@@ -1,9 +1,7 @@
 use syn::braced;
 
 #[cfg(feature = "dynamic-state")]
-use crate::dynamic::{
-    StateDeclaration, StateType, build_dynamic_pattern, ensure_no_capturing_groups,
-};
+use crate::dynamic::{StateDeclaration, StateType, build_dynamic_pattern};
 use crate::{pattern::Pattern, scanner_mode::ScannerMode};
 
 macro_rules! parse_ident {
@@ -359,7 +357,6 @@ fn parse_state_declaration(
             if !paren_content.is_empty() {
                 return Err(paren_content.error("str state takes exactly one regex pattern"));
             }
-            ensure_no_capturing_groups(&pattern.value(), pattern.span())?;
             StateType::Str {
                 pattern: pattern.value(),
             }
@@ -570,127 +567,5 @@ mod tests {
         assert_eq!(mode_string_patterns[2].lookahead, Lookahead::None);
         assert_eq!(mode_string_patterns[3].lookahead, Lookahead::None);
         assert_eq!(mode_string_patterns[4].lookahead, Lookahead::None);
-    }
-
-    #[test]
-    #[cfg(not(feature = "dynamic-state"))]
-    fn test_dynamic_state_dsl_reports_feature_error_when_disabled() {
-        let input = quote::quote! {
-            DisabledScanner {
-                state n: count(0..=4);
-                mode INITIAL {
-                    token r"." => 99;
-                }
-            }
-        };
-        let error = syn::parse2::<ScannerData>(input).unwrap_err();
-        assert!(error.to_string().contains("dynamic-state"));
-
-        let input = quote::quote! {
-            DisabledScanner {
-                mode INITIAL {
-                    token capture("#", n) => 1;
-                }
-            }
-        };
-        let error = syn::parse2::<ScannerData>(input).unwrap_err();
-        assert!(error.to_string().contains("dynamic-state"));
-    }
-
-    #[test]
-    #[cfg(feature = "dynamic-state")]
-    fn test_dynamic_state_rejects_undeclared_state() {
-        let input = quote::quote! {
-            BadScanner {
-                mode INITIAL {
-                    token capture("#", n) => 1;
-                }
-            }
-        };
-        let scanner_data: ScannerData = syn::parse2(input).unwrap();
-        let error = scanner_data.build_scanner_modes().unwrap_err();
-        assert!(error.to_string().contains("not declared"));
-    }
-
-    #[test]
-    #[cfg(feature = "dynamic-state")]
-    fn test_dynamic_state_rejects_type_mismatch() {
-        let input = quote::quote! {
-            BadScanner {
-                state marker: str(r"[A-Z]+");
-                mode INITIAL {
-                    token capture("#", marker) => 1;
-                }
-            }
-        };
-        let scanner_data: ScannerData = syn::parse2(input).unwrap();
-        let error = scanner_data.build_scanner_modes().unwrap_err();
-        assert!(error.to_string().contains("declared as str"));
-    }
-
-    #[test]
-    #[cfg(feature = "dynamic-state")]
-    fn test_dynamic_state_rejects_open_ended_range() {
-        let input = quote::quote! {
-            BadScanner {
-                state n: count(0..=4);
-                mode INITIAL {
-                    token validate("#", n, ..n) => 1;
-                }
-            }
-        };
-        let error = syn::parse2::<ScannerData>(input).unwrap_err();
-        assert!(error.to_string().contains("open-ended"));
-    }
-
-    #[test]
-    #[cfg(feature = "dynamic-state")]
-    fn test_dynamic_state_rejects_capturing_groups() {
-        let input = quote::quote! {
-            BadScanner {
-                state n: count(0..=4);
-                mode INITIAL {
-                    token r"(ab)+" + capture("#", n) => 1;
-                }
-            }
-        };
-        let scanner_data: ScannerData = syn::parse2(input).unwrap();
-        let error = scanner_data.build_scanner_modes().unwrap_err();
-        assert!(error.to_string().contains("capturing groups"));
-    }
-
-    #[test]
-    #[cfg(feature = "dynamic-state")]
-    fn test_dynamic_state_rejects_duplicate_state_ops() {
-        let input = quote::quote! {
-            BadScanner {
-                state n: count(0..=4);
-                mode INITIAL {
-                    token capture("#", n) + validate("#", n) => 1;
-                }
-            }
-        };
-        let error = syn::parse2::<ScannerData>(input).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("only one capture() or validate()")
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "dynamic-state")]
-    fn test_dynamic_state_rejects_duplicate_state_declaration() {
-        let input = quote::quote! {
-            BadScanner {
-                state n: count(0..=4);
-                state n: count(0..=8);
-                mode INITIAL {
-                    token r"." => 99;
-                }
-            }
-        };
-        let error = syn::parse2::<ScannerData>(input).unwrap_err();
-        assert!(error.to_string().contains("declared more than once"));
     }
 }

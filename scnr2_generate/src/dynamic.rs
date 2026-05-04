@@ -1,6 +1,5 @@
 use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote};
-use regex_syntax::hir::{Hir, HirKind};
 
 use crate::{
     character_classes::CharacterClasses,
@@ -295,27 +294,6 @@ impl ToTokens for DynamicPatternWithNumberOfCharacterClasses<'_> {
     }
 }
 
-pub fn ensure_no_capturing_groups(pattern: &str, span: Span) -> syn::Result<()> {
-    let hir = regex_syntax::parse(pattern)
-        .map_err(|e| syn::Error::new(span, format!("invalid regex pattern: {e}")))?;
-    if has_capturing_groups(&hir) {
-        return Err(syn::Error::new(
-            span,
-            "capturing groups are not allowed in dynamic-state patterns; use (?:...)",
-        ));
-    }
-    Ok(())
-}
-
-fn has_capturing_groups(hir: &Hir) -> bool {
-    match hir.kind() {
-        HirKind::Capture(_) => true,
-        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => hirs.iter().any(has_capturing_groups),
-        HirKind::Repetition(repetition) => has_capturing_groups(&repetition.sub),
-        HirKind::Look(_) | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Empty => false,
-    }
-}
-
 pub fn parse_capture_or_validate(input: syn::parse::ParseStream) -> syn::Result<DynamicSegment> {
     let func_name: syn::Ident = input.parse()?;
     let span = func_name.span();
@@ -466,12 +444,6 @@ pub fn build_dynamic_pattern(
             Span::call_site(),
             "exactly one capture() or validate() is required in a dynamic-state token",
         ));
-    }
-
-    for segment in &unresolved.segments {
-        if let DynamicSegment::Regex { pattern, span } = segment {
-            ensure_no_capturing_groups(pattern, *span)?;
-        }
     }
 
     let op_pos = unresolved

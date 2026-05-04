@@ -1,0 +1,5 @@
+error: state 'marker' is declared as str, but used as count
+ --> compile_fail/with_feature/type_mismatch.rs:7:19
+  |
+7 |             token capture("#", marker) => 1;
+  |                   ^^^^^^^

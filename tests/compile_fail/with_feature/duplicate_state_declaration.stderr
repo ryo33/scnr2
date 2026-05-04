@@ -1,0 +1,5 @@
+error: state 'n' is declared more than once
+ --> compile_fail/with_feature/duplicate_state_declaration.rs:6:9
+  |
+6 |         state n: count(0..=8);
+  |         ^^^^^
