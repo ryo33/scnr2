@@ -5,6 +5,8 @@
 
 use crate::Dfa;
 
+/// Per-accept descriptor for a dynamic-state pattern, bundling the prefix, suffix,
+/// and (optionally) capture sub-DFAs with the operation applied to the matched text.
 #[derive(Debug, Clone)]
 pub struct DynamicPattern {
     pub op: DynamicOp,
@@ -13,6 +15,7 @@ pub struct DynamicPattern {
     pub capture: Option<Dfa>,
 }
 
+/// The dynamic operation a `DynamicPattern` performs while evaluating an accept candidate.
 #[derive(Debug, Clone)]
 pub enum DynamicOp {
     CaptureCount {
@@ -36,6 +39,7 @@ pub enum DynamicOp {
     },
 }
 
+/// Comparison kind applied to a captured count against the value stored in a scanner state slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DynamicGuard {
     Equal,
@@ -46,6 +50,7 @@ pub enum DynamicGuard {
     },
 }
 
+/// Arithmetic expression over the stored state value, used by `DynamicGuard::Range` to compute its bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DynamicExpr {
     Lit(usize),
@@ -69,6 +74,7 @@ impl DynamicExpr {
     }
 }
 
+/// A value held in a dynamic-state slot — either a count of unit occurrences or a captured string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DynamicValue {
     Count(usize),
@@ -200,9 +206,9 @@ impl DynamicPattern {
             .filter(|&(_, segment_end)| {
                 dfa_matches_exact(&self.suffix, &matched_text[segment_end..], class_for)
             })
-            // Unlike count, capture widths can differ between splits; pick the
-            // widest substring.
-            .max_by_key(|&(start, end)| end - start)
+            // Widest capture wins; on equal width, the earliest split wins.
+            // `max_by_key` would silently take the *last* equal element.
+            .min_by_key(|&(start, end)| std::cmp::Reverse(end - start))
             .map(|(start, end)| &matched_text[start..end])
     }
 

@@ -594,3 +594,39 @@ fn test_misordered_validates_shadow_each_other() {
     assert_eq!(matches[1].token_type, 10);
     assert_eq!(&input[matches[1].span.clone()], "X##");
 }
+
+// For "abccbc" two equal-width capture splits exist: "bc" at byte 1..3 and
+// "cc" at byte 2..4. The earliest one must win.
+scanner! {
+    StrCaptureTieScanner {
+        state marker: str(r"[bc]{2}");
+
+        mode INITIAL {
+            token r"[ab]*" + capture(marker) + r"[bc]*" => 1;
+            on 1 enter CHECK;
+            token r"." => 99;
+        }
+
+        mode CHECK {
+            token validate(marker) => 2;
+            token r"." => 99;
+        }
+    }
+}
+
+#[test]
+fn test_str_capture_tie_breaks_to_earliest_split() {
+    let input = "abccbcXbc";
+    let scanner = str_capture_tie_scanner::StrCaptureTieScanner::new();
+    let matches: Vec<Match> = scanner.find_matches(input, 0).collect();
+
+    assert_eq!(matches.len(), 3);
+    assert_eq!(matches[0].token_type, 1);
+    assert_eq!(&input[matches[0].span.clone()], "abccbc");
+    assert_eq!(matches[1].token_type, 99);
+    assert_eq!(&input[matches[1].span.clone()], "X");
+    // Captured marker is "bc" (earliest split), so the trailing "bc" validates.
+    // If "cc" were captured instead, validate would fail and matches.len() == 4.
+    assert_eq!(matches[2].token_type, 2);
+    assert_eq!(&input[matches[2].span.clone()], "bc");
+}
